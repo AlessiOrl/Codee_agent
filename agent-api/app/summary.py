@@ -5,7 +5,8 @@ class SummaryService:
     def __init__(self, *, repository: Repository):
         self.repository = repository
 
-    def get_summary(self, *, telegram_user_id: str, telegram_chat_id: str) -> dict:
+    def get_summary(self, *, telegram_user_id: str, telegram_chat_id: str, channel: str) -> dict:
+        del telegram_chat_id
         user = self.repository.get_user_by_telegram_user_id(telegram_user_id=telegram_user_id)
         if not user:
             return {
@@ -20,7 +21,7 @@ class SummaryService:
 
         conversation = self.repository.get_conversation(
             user_id=user["id"],
-            telegram_chat_id=telegram_chat_id,
+            channel=channel,
         )
         if not conversation:
             return {

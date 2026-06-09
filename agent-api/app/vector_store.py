@@ -45,6 +45,7 @@ class VectorStore:
         *,
         user_id: UUID,
         conversation_id: UUID,
+        channel: str,
         content: str,
         memory_type: str,
         importance: int,
@@ -59,6 +60,7 @@ class VectorStore:
                     payload={
                         "user_id": str(user_id),
                         "conversation_id": str(conversation_id),
+                        "channel": channel,
                         "content": content,
                         "memory_type": memory_type,
                         "importance": importance,
@@ -68,12 +70,22 @@ class VectorStore:
         )
         return point_id
 
-    def search_memories(self, *, user_id: UUID, query: str, limit: int = 5) -> list[dict]:
+    def search_memories(
+        self,
+        *,
+        user_id: UUID,
+        query: str,
+        limit: int = 8,
+        channels: list[str] | None = None,
+    ) -> list[dict]:
+        must = [models.FieldCondition(key="user_id", match=models.MatchValue(value=str(user_id)))]
+        if channels:
+            must.append(models.FieldCondition(key="channel", match=models.MatchAny(any=channels)))
         return self._search(
             collection=self.user_memories_collection,
             query=query,
             limit=limit,
-            must=[models.FieldCondition(key="user_id", match=models.MatchValue(value=str(user_id)))],
+            must=must,
         )
 
     def upsert_document_chunk(
@@ -81,6 +93,7 @@ class VectorStore:
         *,
         user_id: UUID,
         conversation_id: UUID | None,
+        channel: str | None,
         document_id: UUID,
         chunk_id: UUID,
         chunk_index: int,
@@ -97,6 +110,8 @@ class VectorStore:
                     payload={
                         "user_id": str(user_id),
                         "conversation_id": str(conversation_id) if conversation_id else None,
+                        "channel": channel,
+                        "source_type": "document_chunk",
                         "document_id": str(document_id),
                         "chunk_id": str(chunk_id),
                         "chunk_index": chunk_index,
@@ -108,12 +123,75 @@ class VectorStore:
         )
         return point_id
 
-    def search_documents(self, *, user_id: UUID, query: str, limit: int = 5) -> list[dict]:
+    def search_documents(
+        self,
+        *,
+        user_id: UUID,
+        query: str,
+        limit: int = 8,
+        channels: list[str] | None = None,
+    ) -> list[dict]:
+        must = [models.FieldCondition(key="user_id", match=models.MatchValue(value=str(user_id)))]
+        if channels:
+            must.append(models.FieldCondition(key="channel", match=models.MatchAny(any=channels)))
         return self._search(
             collection=self.documents_collection,
             query=query,
             limit=limit,
-            must=[models.FieldCondition(key="user_id", match=models.MatchValue(value=str(user_id)))],
+            must=must,
+            must_not=[
+                models.FieldCondition(key="source_type", match=models.MatchValue(value="context_message")),
+            ],
+        )
+
+    def upsert_context_message(
+        self,
+        *,
+        user_id: UUID,
+        channel: str,
+        telegram_chat_id: str,
+        telegram_message_id: str | None,
+        content: str,
+    ) -> str:
+        point_id = str(uuid4())
+        self.client.upsert(
+            collection_name=self.documents_collection,
+            points=[
+                models.PointStruct(
+                    id=point_id,
+                    vector=self.embeddings.embed(content),
+                    payload={
+                        "source_type": "context_message",
+                        "user_id": str(user_id),
+                        "channel": channel,
+                        "telegram_chat_id": telegram_chat_id,
+                        "telegram_message_id": telegram_message_id,
+                        "content": content,
+                    },
+                )
+            ],
+        )
+        return point_id
+
+    def search_context_messages(
+        self,
+        *,
+        user_id: UUID,
+        channels: list[str],
+        query: str,
+        limit: int,
+    ) -> list[dict]:
+        if not channels or limit <= 0:
+            return []
+        return self._search(
+            collection=self.documents_collection,
+            query=query,
+            limit=limit,
+            must=[
+                models.FieldCondition(key="user_id", match=models.MatchValue(value=str(user_id))),
+                models.FieldCondition(key="source_type", match=models.MatchValue(value="context_message")),
+                models.FieldCondition(key="channel", match=models.MatchAny(any=channels)),
+            ],
         )
 
     def delete_memory_points(self, point_ids: list[str]) -> None:
@@ -150,9 +228,13 @@ class VectorStore:
         query: str,
         limit: int,
         must: list[models.FieldCondition],
+        must_not: list[models.FieldCondition] | None = None,
     ) -> list[dict]:
         query_vector = self.embeddings.embed(query)
-        query_filter = models.Filter(must=must)
+        filter_kwargs: dict[str, list[models.FieldCondition]] = {"must": must}
+        if must_not:
+            filter_kwargs["must_not"] = must_not
+        query_filter = models.Filter(**filter_kwargs)
         try:
             if hasattr(self.client, "query_points"):
                 result = self.client.query_points(

@@ -34,7 +34,7 @@ class FakeRepository:
 def test_summary_returns_current_summary_and_explains_storage() -> None:
     service = SummaryService(repository=FakeRepository())
 
-    result = service.get_summary(telegram_user_id="1", telegram_chat_id="2")
+    result = service.get_summary(telegram_user_id="1", telegram_chat_id="2", channel="private")
 
     assert result["summary"] == "User prefers concise answers."
     assert "plain text stored in Postgres" in result["reply"]
@@ -44,7 +44,7 @@ def test_summary_returns_current_summary_and_explains_storage() -> None:
 def test_summary_handles_missing_summary_cleanly() -> None:
     service = SummaryService(repository=FakeRepository(has_summary=False))
 
-    result = service.get_summary(telegram_user_id="1", telegram_chat_id="2")
+    result = service.get_summary(telegram_user_id="1", telegram_chat_id="2", channel="private")
 
     assert result["summary"] is None
     assert "not embeddings" in result["reply"]

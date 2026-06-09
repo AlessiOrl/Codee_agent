@@ -47,6 +47,17 @@ POSTGRES_USER=agent
 POSTGRES_PASSWORD=your_database_password
 POSTGRES_DB=agent_db
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+CONTEXT_OWNER_TELEGRAM_USER_ID=your_telegram_user_id
+DOMOTICS_CHAT_ID=your_domotics_chat_id
+UNRAID_CHAT_ID=your_unraid_chat_id
+PLEX_CHAT_ID=your_plex_chat_id
+
+LOG_LEVEL=INFO
+DOCKER_LOG_MAX_SIZE=10m
+DOCKER_LOG_MAX_FILE=3
+POSTGRES_LOG_MIN_MESSAGES=warning
+POSTGRES_LOG_MIN_ERROR_STATEMENT=error
+QDRANT_LOG_LEVEL=warn
 
 AGENT_API_KEY=your_random_agent_api_key
 AGENT_API_URL=http://agent-api:8000
@@ -65,6 +76,13 @@ OLLAMA_EMBEDDINGS_BASE_URL=http://host.docker.internal:11434
 OLLAMA_STATUS_TIMEOUT_SECONDS=4
 EMBEDDING_MODEL=qwen3-embedding:4b
 VECTOR_SIZE=2560
+CROSS_CHANNEL_MEMORY_LIMIT=3
+CROSS_CHANNEL_DOC_LIMIT=2
+CROSS_CHANNEL_MIN_SCORE=0.6
+CONTEXT_ROUTER_ENABLED=true
+CONTEXT_ROUTER_MAX_FEED_MESSAGES=6
+CONTEXT_ROUTER_MIN_CONFIDENCE=0.4
+CONTEXT_DEBUG_JSON=false
 ```
 
 How these values are used:
@@ -81,6 +99,12 @@ How these values are used:
 - `OLLAMA_BASE_URL` is used only for the fast primary Ollama status check before chat generation.
 - `OLLAMA_EMBEDDINGS_BASE_URL` is the address that the `agent-api` container uses to reach Ollama. For your Qwen3 embedding model, set `EMBEDDING_MODEL=qwen3-embedding:4b` and `VECTOR_SIZE=2560`.
 - `TELEGRAM_BOT_TOKEN` lets the Python Telegram bot call Telegram `getUpdates` and `sendMessage` without a public HTTPS webhook.
+- `CONTEXT_OWNER_TELEGRAM_USER_ID` attaches passive feed messages to your private user context.
+- `DOMOTICS_CHAT_ID`, `UNRAID_CHAT_ID`, and `PLEX_CHAT_ID` map passive Telegram feeds to the fixed logical channels used for storage and context routing.
+- `LOG_LEVEL` controls Python service verbosity with compact one-line logs. `DOCKER_LOG_MAX_SIZE` and `DOCKER_LOG_MAX_FILE` keep every container log bounded.
+- `POSTGRES_LOG_MIN_MESSAGES`, `POSTGRES_LOG_MIN_ERROR_STATEMENT`, and `QDRANT_LOG_LEVEL` reduce routine infrastructure noise.
+- `CONTEXT_ROUTER_ENABLED`, `CONTEXT_ROUTER_MAX_FEED_MESSAGES`, and `CONTEXT_ROUTER_MIN_CONFIDENCE` control the LangGraph router that decides whether passive feed context is useful for a private chat question.
+- `CONTEXT_DEBUG_JSON=true` prints JSON-shaped debug events for Telegram feed routing, context ingestion, LangGraph router decisions, feed retrieval, and prompt context assembly. These logs include message text, so leave it off except while debugging.
 
 Notes:
 
@@ -113,8 +137,8 @@ If existing Qdrant collections were created with a different vector size, the ap
 - `GET /health`
 - `POST /debug/llm`
 - `POST /debug/embedding`
-- `POST /chat`
 - `POST /chat/stream`
+- `POST /context/messages`
 - `POST /forget`
 - `POST /summary`
 - `POST /documents/upload`
@@ -132,6 +156,8 @@ The `telegram-bot` service polls Telegram every few seconds, so it works on a lo
 Configure:
 
 - `TELEGRAM_BOT_TOKEN` in `.env`.
+- `CONTEXT_OWNER_TELEGRAM_USER_ID` in `.env`.
+- `DOMOTICS_CHAT_ID`, `UNRAID_CHAT_ID`, and `PLEX_CHAT_ID` in `.env`.
 - `AGENT_API_KEY` in `.env`; it must match the key used by `agent-api`.
 - `AGENT_API_URL=http://agent-api:8000` when running in Compose.
 
@@ -139,16 +165,17 @@ Telegram commands are handled locally by `telegram-bot` and do not call `agent-a
 
 - `/start`
 - `/help`
-
-The `/forget` command is forwarded to `agent-api` and deletes stored user data across chats:
-
 - `/summary`
 - `/forget`
 - `/forget <days>`
+- `/forget_all`
+- `/forget_all <days>`
+
+The `/summary` and `/forget` commands are scoped to the private chat. `/forget_all` removes private chat data plus passive feed data for that user.
 
 Any other slash command is handled locally.
 
-Normal text messages are forwarded to `POST /chat/stream`. The bot sends a typing action, creates a placeholder message, and edits that message as streamed text arrives. If streaming cannot start, it falls back to `POST /chat`. Final replies are sent with `parse_mode=MarkdownV2` so markdown-style replies, code fences, and clickable citations render correctly. If Telegram rejects the formatting, the bot automatically retries the final reply as plain text. Non-text messages receive a local unsupported-message reply.
+Normal private-chat text messages are forwarded to `POST /chat/stream`. Configured `domotics`, `unraid`, and `plex` chats are passive feeds only: the bot stores their messages through `POST /context/messages` and never replies there. For private chats, LangGraph first asks an LLM router whether any passive feed is relevant, retrieves only the selected feed messages, and labels that context in the prompt. The bot sends a typing action, creates a placeholder message, and edits that message as streamed text arrives. Chat responses use the streaming endpoint only. Final replies are sent with `parse_mode=MarkdownV2` so markdown-style replies, code fences, and clickable citations render correctly. If Telegram rejects the formatting, the bot automatically retries the final reply as plain text. Non-text messages in private chat receive a local unsupported-message reply.
 
 Smoke test in Telegram:
 
@@ -158,6 +185,7 @@ Smoke test in Telegram:
 /summary
 /forget
 /forget 1
+/forget_all
 Reply with pong.
 ```
 
@@ -180,4 +208,4 @@ Handling command locally update_id=... command=/start
 Forwarding text update_id=... chat_id=... to agent-api
 ```
 
-Routine `/health` access logs and HTTP client request logs are silenced by default. Set `LOG_LEVEL=DEBUG` in `.env` only when you need deeper debugging.
+Routine `/health` access logs, HTTP client request logs, Postgres info logs, and Qdrant info logs are silenced by default. Python services use compact logs like `I agent-api | Agent API initialized`. Set `CONTEXT_DEBUG_JSON=true` when diagnosing passive feed routing or retrieval; set `LOG_LEVEL=DEBUG` or `QDRANT_LOG_LEVEL=info` only when you need deeper infrastructure debugging.

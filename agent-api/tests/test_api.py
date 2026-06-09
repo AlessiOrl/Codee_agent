@@ -17,13 +17,6 @@ def configure_env(monkeypatch) -> None:
 
 
 class FakeGraph:
-    def invoke(self, payload):
-        return {
-            "reply": f"echo: {payload['text']}",
-            "conversation": {"id": uuid4()},
-            "sources": [{"title": "Docs", "url": "https://example.test"}],
-        }
-
     def stream(self, payload):
         conversation_id = uuid4()
         yield {"type": "delta", "content": "echo: "}
@@ -42,8 +35,28 @@ class FakeDb:
 
 
 class FakeVector:
+    def __init__(self) -> None:
+        self.context_calls = []
+
     def health(self):
         return "ok"
+
+    def upsert_context_message(self, **kwargs):
+        self.context_calls.append(kwargs)
+        return "context-point-1"
+
+
+class FakeRepository:
+    def __init__(self) -> None:
+        self.user_id = uuid4()
+        self.context_calls = []
+
+    def upsert_user(self, **kwargs):
+        return {"id": self.user_id, **kwargs}
+
+    def save_context_message(self, **kwargs):
+        self.context_calls.append(kwargs)
+        return {"id": uuid4(), **kwargs}
 
 
 class FakeForgetService:
@@ -52,13 +65,17 @@ class FakeForgetService:
 
     def forget(self, **kwargs):
         self.calls.append(kwargs)
+        scope = kwargs.get("scope", "channel")
         return {
             "reply": "Forgot stored data.",
-            "scope": "all" if kwargs["days"] is None else "recent",
+            "scope": "recent_all" if scope == "all" and kwargs["days"] is not None else (
+                "all" if scope == "all" else ("recent" if kwargs["days"] is not None else "channel")
+            ),
             "counts": {
                 "messages": 1,
                 "summaries": 2,
                 "memories": 3,
+                "context_messages": 4,
                 "documents": 4,
                 "document_chunks": 5,
                 "tool_calls": 6,
@@ -87,44 +104,6 @@ class RedirectingLlm:
         )
 
 
-def test_chat_requires_bearer_token(monkeypatch) -> None:
-    configure_env(monkeypatch)
-    app.state.agent_graph = FakeGraph()
-    client = TestClient(app)
-
-    response = client.post(
-        "/chat",
-        json={
-            "telegram_user_id": "1",
-            "telegram_chat_id": "2",
-            "telegram_message_id": "3",
-            "text": "hello",
-        },
-    )
-
-    assert response.status_code == 401
-
-
-def test_chat_returns_graph_response(monkeypatch) -> None:
-    configure_env(monkeypatch)
-    app.state.agent_graph = FakeGraph()
-    client = TestClient(app)
-
-    response = client.post(
-        "/chat",
-        headers={"Authorization": "Bearer test-key"},
-        json={
-            "telegram_user_id": "1",
-            "telegram_chat_id": "2",
-            "telegram_message_id": "3",
-            "text": "hello",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["reply"] == "echo: hello"
-
-
 def test_chat_stream_requires_bearer_token(monkeypatch) -> None:
     configure_env(monkeypatch)
     app.state.agent_graph = FakeGraph()
@@ -135,6 +114,7 @@ def test_chat_stream_requires_bearer_token(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
             "telegram_message_id": "3",
             "text": "hello",
         },
@@ -154,6 +134,7 @@ def test_chat_stream_returns_ndjson_events(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
             "telegram_message_id": "3",
             "text": "hello",
         },
@@ -202,6 +183,7 @@ def test_forget_requires_bearer_token(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
         },
     )
 
@@ -220,13 +202,14 @@ def test_forget_full_reset_returns_service_response(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
         },
     )
 
     assert response.status_code == 200
     assert response.json()["reply"] == "Forgot stored data."
-    assert response.json()["scope"] == "all"
-    assert service.calls == [{"telegram_user_id": "1", "telegram_chat_id": "2", "days": None}]
+    assert response.json()["scope"] == "channel"
+    assert service.calls == [{"telegram_user_id": "1", "telegram_chat_id": "2", "channel": "private", "scope": "channel", "days": None}]
 
 
 def test_forget_recent_delete_passes_days(monkeypatch) -> None:
@@ -241,13 +224,14 @@ def test_forget_recent_delete_passes_days(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
             "days": 3,
         },
     )
 
     assert response.status_code == 200
     assert response.json()["scope"] == "recent"
-    assert service.calls == [{"telegram_user_id": "1", "telegram_chat_id": "2", "days": 3}]
+    assert service.calls == [{"telegram_user_id": "1", "telegram_chat_id": "2", "channel": "private", "scope": "channel", "days": 3}]
 
 
 def test_summary_requires_bearer_token(monkeypatch) -> None:
@@ -260,6 +244,7 @@ def test_summary_requires_bearer_token(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
         },
     )
 
@@ -278,9 +263,36 @@ def test_summary_returns_service_response(monkeypatch) -> None:
         json={
             "telegram_user_id": "1",
             "telegram_chat_id": "2",
+            "channel": "private",
         },
     )
 
     assert response.status_code == 200
     assert response.json()["summary"] == "User is testing Codee."
-    assert service.calls == [{"telegram_user_id": "1", "telegram_chat_id": "2"}]
+    assert service.calls == [{"telegram_user_id": "1", "telegram_chat_id": "2", "channel": "private"}]
+
+
+def test_context_message_ingest_stores_passive_feed(monkeypatch) -> None:
+    configure_env(monkeypatch)
+    repo = FakeRepository()
+    vector = FakeVector()
+    app.state.repository = repo
+    app.state.vector_store = vector
+    client = TestClient(app)
+
+    response = client.post(
+        "/context/messages",
+        headers={"Authorization": "Bearer test-key"},
+        json={
+            "telegram_user_id": "1",
+            "telegram_chat_id": "-100",
+            "telegram_message_id": "55",
+            "channel": "domotics",
+            "text": "Garage door opened.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "stored"
+    assert vector.context_calls[0]["channel"] == "domotics"
+    assert repo.context_calls[0]["qdrant_point_id"] == "context-point-1"

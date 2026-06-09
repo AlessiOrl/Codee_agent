@@ -14,6 +14,7 @@ class FakeRepository:
                 "messages": 2,
                 "summaries": 1,
                 "memories": 3,
+                "context_messages": 2,
                 "documents": 1,
                 "document_chunks": 4,
                 "tool_calls": 2,
@@ -51,13 +52,14 @@ def test_forget_full_reset_deletes_all_user_data() -> None:
     vector = FakeVectorStore()
     service = ForgetService(repository=repo, vector_store=vector)
 
-    result = service.forget(telegram_user_id="1", telegram_chat_id="2", days=None)
+    result = service.forget(telegram_user_id="1", telegram_chat_id="2", channel="private", days=None)
 
-    assert result["scope"] == "all"
+    assert result["scope"] == "channel"
     assert result["counts"]["messages"] == 2
-    assert "Forgot all stored data" in result["reply"]
+    assert "channel 'private'" in result["reply"]
     assert repo.calls[1][0] == "forget_user_data"
     assert repo.calls[1][1]["user_id"] == repo.user_id
+    assert repo.calls[1][1]["channel"] == "private"
     assert repo.calls[1][1]["cutoff"] is None
     assert vector.memory_deletes == [["mem-1", "mem-2"]]
     assert vector.document_deletes == [["doc-1"]]
@@ -69,7 +71,7 @@ def test_forget_recent_delete_uses_cutoff_and_reports_recent_scope() -> None:
     service = ForgetService(repository=repo, vector_store=vector)
 
     before = datetime.now(timezone.utc) - timedelta(days=2, seconds=5)
-    result = service.forget(telegram_user_id="1", telegram_chat_id="2", days=2)
+    result = service.forget(telegram_user_id="1", telegram_chat_id="2", channel="private", days=2)
     after = datetime.now(timezone.utc) - timedelta(days=2) + timedelta(seconds=5)
 
     cutoff = repo.calls[1][1]["cutoff"]
@@ -83,12 +85,13 @@ def test_forget_unknown_user_is_safe_noop() -> None:
     vector = FakeVectorStore()
     service = ForgetService(repository=repo, vector_store=vector)
 
-    result = service.forget(telegram_user_id="1", telegram_chat_id="2", days=3)
+    result = service.forget(telegram_user_id="1", telegram_chat_id="2", channel="private", days=3)
 
     assert result["counts"] == {
         "messages": 0,
         "summaries": 0,
         "memories": 0,
+        "context_messages": 0,
         "documents": 0,
         "document_chunks": 0,
         "tool_calls": 0,
@@ -97,3 +100,21 @@ def test_forget_unknown_user_is_safe_noop() -> None:
     assert "nothing was removed" in result["reply"].lower()
     assert vector.memory_deletes == []
     assert vector.document_deletes == []
+
+
+def test_forget_all_deletes_every_channel() -> None:
+    repo = FakeRepository()
+    vector = FakeVectorStore()
+    service = ForgetService(repository=repo, vector_store=vector)
+
+    result = service.forget(
+        telegram_user_id="1",
+        telegram_chat_id="2",
+        channel="private",
+        days=None,
+        scope="all",
+    )
+
+    assert result["scope"] == "all"
+    assert repo.calls[1][1]["channel"] is None
+    assert "Forgot all stored data for this user." in result["reply"]

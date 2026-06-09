@@ -25,6 +25,23 @@ def json_line(data: dict) -> str:
     return json.dumps(data)
 
 
+def make_settings() -> Settings:
+    return Settings(
+        telegram_bot_token="token",
+        agent_api_url="http://agent-api:8000",
+        agent_api_key="key",
+        poll_interval_seconds=3.0,
+        telegram_timeout_seconds=30.0,
+        agent_timeout_seconds=180.0,
+        state_path=Path("telegram-offset.json"),
+        domotics_chat_id="2",
+        unraid_chat_id="22",
+        plex_chat_id="222",
+        context_owner_telegram_user_id="1",
+        context_debug_json=False,
+    )
+
+
 class TelegramBotHelpersTest(unittest.TestCase):
     def test_command_name_strips_bot_suffix(self) -> None:
         self.assertEqual(command_name("/start@CodeeBot hello"), "/start")
@@ -47,6 +64,7 @@ class TelegramBotHelpersTest(unittest.TestCase):
         self.assertEqual(parse_forget_command("/forget 3"), 3)
         self.assertIn("positive integer", parse_forget_command("/forget abc"))
         self.assertIn("positive integer", parse_forget_command("/forget -1"))
+        self.assertIsNone(parse_forget_command("/forget_all", expected_command="/forget_all"))
 
     def test_render_telegram_markdown_escapes_plain_text(self) -> None:
         rendered = render_telegram_markdown("Hello - world. Use [brackets] safely!")
@@ -155,15 +173,7 @@ class TelegramBotHelpersTest(unittest.TestCase):
 
     @patch("app.main.httpx.Client")
     def test_send_message_retries_plain_text_after_markdown_failure(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
 
         first_response = MagicMock()
@@ -195,15 +205,7 @@ class TelegramBotHelpersTest(unittest.TestCase):
 
     @patch("app.main.httpx.Client")
     def test_call_forget_posts_full_reset_to_agent_api(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
 
         response = MagicMock()
@@ -221,26 +223,22 @@ class TelegramBotHelpersTest(unittest.TestCase):
                 "text": "/forget",
                 "from": {"id": 1},
                 "chat": {"id": 2},
-            }
+            },
+            channel="private",
+            scope="channel",
         )
 
         self.assertEqual(reply, "Forgot all stored data.")
         payload = client.post.call_args.kwargs["json"]
         self.assertEqual(payload["telegram_user_id"], "1")
         self.assertEqual(payload["telegram_chat_id"], "2")
+        self.assertEqual(payload["channel"], "private")
+        self.assertEqual(payload["scope"], "channel")
         self.assertIsNone(payload["days"])
 
     @patch("app.main.httpx.Client")
     def test_call_forget_posts_recent_delete_to_agent_api(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
 
         response = MagicMock()
@@ -258,7 +256,9 @@ class TelegramBotHelpersTest(unittest.TestCase):
                 "text": "/forget 3",
                 "from": {"id": 1},
                 "chat": {"id": 2},
-            }
+            },
+            channel="private",
+            scope="channel",
         )
 
         self.assertEqual(reply, "Forgot stored data from the last 3 day(s).")
@@ -267,15 +267,7 @@ class TelegramBotHelpersTest(unittest.TestCase):
 
     @patch("app.main.httpx.Client")
     def test_call_summary_posts_to_agent_api(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
 
         response = MagicMock()
@@ -293,50 +285,23 @@ class TelegramBotHelpersTest(unittest.TestCase):
                 "text": "/summary",
                 "from": {"id": 1},
                 "chat": {"id": 2},
-            }
+            },
+            channel="private",
         )
 
         self.assertEqual(reply, "Current chat summary:\nUser is testing Codee.")
         payload = client.post.call_args.kwargs["json"]
         self.assertEqual(payload["telegram_user_id"], "1")
         self.assertEqual(payload["telegram_chat_id"], "2")
+        self.assertEqual(payload["channel"], "private")
 
-    @patch("app.main.httpx.Client")
-    def test_call_agent_injects_clickable_source_citations(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
-        bot = TelegramBot(settings)
-
-        response = MagicMock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {
-            "reply": "Kimi Antonelli won [1][2].",
-            "sources": [
+    def test_inject_source_citations_formats_multiple_sources(self) -> None:
+        reply = inject_source_citations(
+            "Kimi Antonelli won [1][2].",
+            [
                 {"title": "Race recap", "url": "https://example.test/race"},
                 {"title": "Monaco report", "url": "https://example.test/monaco"},
             ],
-        }
-
-        client = MagicMock()
-        client.post.return_value = response
-        client.__enter__.return_value = client
-        client.__exit__.return_value = None
-        client_cls.return_value = client
-
-        reply = bot.call_agent(
-            {
-                "text": "Who won Monaco?",
-                "message_id": 3,
-                "from": {"id": 1, "username": "orlando", "first_name": "Orlando"},
-                "chat": {"id": 2},
-            }
         )
 
         self.assertEqual(
@@ -346,15 +311,7 @@ class TelegramBotHelpersTest(unittest.TestCase):
 
     @patch("app.main.httpx.Client")
     def test_stream_agent_reply_edits_placeholder_and_final_citations(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
         bot.send_chat_action = MagicMock()
         bot.send_placeholder_message = MagicMock(return_value=44)
@@ -389,7 +346,8 @@ class TelegramBotHelpersTest(unittest.TestCase):
                 "message_id": 3,
                 "from": {"id": 1, "username": "orlando", "first_name": "Orlando"},
                 "chat": {"id": 2},
-            }
+            },
+            channel="private",
         )
 
         self.assertTrue(handled)
@@ -406,19 +364,10 @@ class TelegramBotHelpersTest(unittest.TestCase):
         )
         self.assertTrue(final_edit.kwargs["markdown"])
 
-    def test_handle_update_falls_back_when_streaming_does_not_start(self) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+    def test_handle_update_reports_when_streaming_does_not_start(self) -> None:
+        settings = make_settings()
         bot = TelegramBot(settings)
         bot.stream_agent_reply = MagicMock(return_value=False)
-        bot.call_agent = MagicMock(return_value="fallback answer")
         bot.send_message = MagicMock()
 
         bot.handle_update(
@@ -428,26 +377,91 @@ class TelegramBotHelpersTest(unittest.TestCase):
                     "text": "hello",
                     "message_id": 3,
                     "from": {"id": 1},
-                    "chat": {"id": 2},
+                    "chat": {"id": 999, "type": "private"},
                 },
             }
         )
 
         bot.stream_agent_reply.assert_called()
-        bot.call_agent.assert_called()
-        bot.send_message.assert_called_with(2, "fallback answer")
+        bot.send_message.assert_called_with(999, "Codee could not start a streaming reply. Please try again.")
+
+    def test_handle_update_ignores_unmapped_non_private_chat(self) -> None:
+        settings = make_settings()
+        bot = TelegramBot(settings)
+        bot.send_message = MagicMock()
+        bot.stream_agent_reply = MagicMock()
+
+        bot.handle_update(
+            {
+                "update_id": 11,
+                "message": {
+                    "text": "hello",
+                    "message_id": 3,
+                    "from": {"id": 1},
+                    "chat": {"id": 999, "type": "group"},
+                },
+            }
+        )
+
+        bot.stream_agent_reply.assert_not_called()
+        bot.send_message.assert_not_called()
+
+    def test_handle_update_stores_feed_message_without_reply(self) -> None:
+        settings = make_settings()
+        bot = TelegramBot(settings)
+        bot.call_context_ingest = MagicMock(return_value=True)
+        bot.send_message = MagicMock()
+        bot.stream_agent_reply = MagicMock()
+
+        bot.handle_update(
+            {
+                "update_id": 12,
+                "channel_post": {
+                    "text": "Garage door opened.",
+                    "message_id": 4,
+                    "chat": {"id": 2, "type": "channel"},
+                },
+            }
+        )
+
+        bot.call_context_ingest.assert_called_once()
+        self.assertEqual(bot.call_context_ingest.call_args.kwargs["channel"], "domotics")
+        bot.stream_agent_reply.assert_not_called()
+        bot.send_message.assert_not_called()
+
+    @patch("app.main.httpx.Client")
+    def test_call_context_ingest_posts_passive_message(self, client_cls: MagicMock) -> None:
+        settings = make_settings()
+        bot = TelegramBot(settings)
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+
+        client = MagicMock()
+        client.post.return_value = response
+        client.__enter__.return_value = client
+        client.__exit__.return_value = None
+        client_cls.return_value = client
+
+        ok = bot.call_context_ingest(
+            {
+                "text": "Array parity check started.",
+                "message_id": 8,
+                "chat": {"id": 22, "type": "channel"},
+            },
+            channel="unraid",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(client.post.call_args.args[0], "http://agent-api:8000/context/messages")
+        payload = client.post.call_args.kwargs["json"]
+        self.assertEqual(payload["telegram_user_id"], "1")
+        self.assertEqual(payload["telegram_chat_id"], "22")
+        self.assertEqual(payload["channel"], "unraid")
 
     @patch("app.main.httpx.Client")
     def test_edit_message_retries_plain_text_after_markdown_failure(self, client_cls: MagicMock) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
 
         first_response = MagicMock()
@@ -478,15 +492,7 @@ class TelegramBotHelpersTest(unittest.TestCase):
         self.assertEqual(second_payload["text"], "Hello - world")
 
     def test_call_forget_rejects_invalid_syntax_locally(self) -> None:
-        settings = Settings(
-            telegram_bot_token="token",
-            agent_api_url="http://agent-api:8000",
-            agent_api_key="key",
-            poll_interval_seconds=3.0,
-            telegram_timeout_seconds=30.0,
-            agent_timeout_seconds=180.0,
-            state_path=Path("telegram-offset.json"),
-        )
+        settings = make_settings()
         bot = TelegramBot(settings)
 
         reply = bot.call_forget(
@@ -494,7 +500,9 @@ class TelegramBotHelpersTest(unittest.TestCase):
                 "text": "/forget nope",
                 "from": {"id": 1},
                 "chat": {"id": 2},
-            }
+            },
+            channel="private",
+            scope="channel",
         )
 
         self.assertIn("positive integer", reply)

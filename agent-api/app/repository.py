@@ -39,29 +39,30 @@ class Repository:
             ).fetchone()
             return dict(row) if row else None
 
-    def upsert_conversation(self, *, user_id: UUID, telegram_chat_id: str) -> dict[str, Any]:
+    def upsert_conversation(self, *, user_id: UUID, telegram_chat_id: str, channel: str) -> dict[str, Any]:
         with self.db.connect() as conn:
             row = conn.execute(
                 """
-                INSERT INTO conversations (user_id, telegram_chat_id)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id, telegram_chat_id) DO UPDATE
-                SET updated_at = now()
+                INSERT INTO conversations (user_id, telegram_chat_id, channel)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, channel) DO UPDATE
+                SET telegram_chat_id = EXCLUDED.telegram_chat_id,
+                    updated_at = now()
                 RETURNING *
                 """,
-                (user_id, telegram_chat_id),
+                (user_id, telegram_chat_id, channel),
             ).fetchone()
             return dict(row)
 
-    def get_conversation(self, *, user_id: UUID, telegram_chat_id: str) -> dict[str, Any] | None:
+    def get_conversation(self, *, user_id: UUID, channel: str) -> dict[str, Any] | None:
         with self.db.connect() as conn:
             row = conn.execute(
                 """
                 SELECT *
                 FROM conversations
-                WHERE user_id = %s AND telegram_chat_id = %s
+                WHERE user_id = %s AND channel = %s
                 """,
-                (user_id, telegram_chat_id),
+                (user_id, channel),
             ).fetchone()
             return dict(row) if row else None
 
@@ -145,6 +146,8 @@ class Repository:
         self,
         *,
         user_id: UUID,
+        conversation_id: UUID | None,
+        channel: str | None,
         content: str,
         memory_type: str,
         qdrant_point_id: str,
@@ -154,12 +157,12 @@ class Repository:
             row = conn.execute(
                 """
                 INSERT INTO memories (
-                    user_id, memory_type, content, qdrant_point_id, importance
+                    user_id, conversation_id, channel, memory_type, content, qdrant_point_id, importance
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (user_id, memory_type, content, qdrant_point_id, importance),
+                (user_id, conversation_id, channel, memory_type, content, qdrant_point_id, importance),
             ).fetchone()
             return dict(row)
 
@@ -210,26 +213,81 @@ class Repository:
                 (qdrant_point_id, chunk_id),
             )
 
+    def save_context_message(
+        self,
+        *,
+        user_id: UUID,
+        channel: str,
+        telegram_chat_id: str,
+        telegram_message_id: str | None,
+        content: str,
+        qdrant_point_id: str,
+    ) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO context_messages (
+                    user_id, channel, telegram_chat_id, telegram_message_id, content, qdrant_point_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (user_id, channel, telegram_chat_id, telegram_message_id, content, qdrant_point_id),
+            ).fetchone()
+            return dict(row)
+
+    def recent_context_messages(
+        self,
+        *,
+        user_id: UUID,
+        channels: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not channels or limit <= 0:
+            return []
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, channel, telegram_chat_id, telegram_message_id, content, qdrant_point_id, created_at
+                FROM context_messages
+                WHERE user_id = %s
+                  AND channel = ANY(%s)
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (user_id, channels, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+
     def forget_user_data(
         self,
         *,
         user_id: UUID,
+        channel: str | None = None,
         cutoff: datetime | None = None,
     ) -> dict[str, Any]:
         with self.db.connect() as conn:
-            conversation_rows = conn.execute(
-                "SELECT id FROM conversations WHERE user_id = %s",
-                (user_id,),
-            ).fetchall()
+            conversation_sql = "SELECT id FROM conversations WHERE user_id = %s"
+            conversation_params: tuple[Any, ...] = (user_id,)
+            if channel is not None:
+                conversation_sql += " AND channel = %s"
+                conversation_params += (channel,)
+            conversation_rows = conn.execute(conversation_sql, conversation_params).fetchall()
             conversation_ids = [row["id"] for row in conversation_rows]
 
-            memory_rows = conn.execute(
-                f"""
+            memory_sql = """
                 SELECT id, qdrant_point_id
                 FROM memories
-                WHERE user_id = %s{self._cutoff_clause('created_at', cutoff)}
-                """,
-                self._cutoff_params((user_id,), cutoff),
+                WHERE user_id = %s
+            """
+            memory_params: tuple[Any, ...] = (user_id,)
+            if channel is not None:
+                memory_sql += " AND channel = %s"
+                memory_params += (channel,)
+            memory_sql += self._cutoff_clause("created_at", cutoff)
+            memory_rows = conn.execute(
+                memory_sql,
+                self._cutoff_params(memory_params, cutoff),
             ).fetchall()
             memory_ids = [row["id"] for row in memory_rows]
             memory_point_ids = [
@@ -238,15 +296,43 @@ class Repository:
                 if row.get("qdrant_point_id")
             ]
 
+            document_sql = """
+                SELECT d.id
+                FROM documents d
+                LEFT JOIN conversations c ON c.id = d.conversation_id
+                WHERE d.user_id = %s
+            """
+            document_params: tuple[Any, ...] = (user_id,)
+            if channel is not None:
+                document_sql += " AND c.channel = %s"
+                document_params += (channel,)
+            document_sql += self._cutoff_clause("d.created_at", cutoff)
             document_rows = conn.execute(
-                f"""
-                SELECT id
-                FROM documents
-                WHERE user_id = %s{self._cutoff_clause('created_at', cutoff)}
-                """,
-                self._cutoff_params((user_id,), cutoff),
+                document_sql,
+                self._cutoff_params(document_params, cutoff),
             ).fetchall()
             document_ids = [row["id"] for row in document_rows]
+
+            context_sql = """
+                SELECT id, qdrant_point_id
+                FROM context_messages
+                WHERE user_id = %s
+            """
+            context_params: tuple[Any, ...] = (user_id,)
+            if channel is not None:
+                context_sql += " AND channel = %s"
+                context_params += (channel,)
+            context_sql += self._cutoff_clause("created_at", cutoff)
+            context_rows = conn.execute(
+                context_sql,
+                self._cutoff_params(context_params, cutoff),
+            ).fetchall()
+            context_ids = [row["id"] for row in context_rows]
+            context_point_ids = [
+                row["qdrant_point_id"]
+                for row in context_rows
+                if row.get("qdrant_point_id")
+            ]
 
             document_chunk_rows = []
             if document_ids:
@@ -324,18 +410,25 @@ class Repository:
                 conn.execute("DELETE FROM memories WHERE id = ANY(%s)", (memory_ids,))
             if document_ids:
                 conn.execute("DELETE FROM documents WHERE id = ANY(%s)", (document_ids,))
+            if context_ids:
+                conn.execute("DELETE FROM context_messages WHERE id = ANY(%s)", (context_ids,))
 
-            if cutoff is None:
+            if cutoff is None and channel is None:
                 conversation_delete_row = conn.execute(
                     "DELETE FROM conversations WHERE user_id = %s RETURNING id",
                     (user_id,),
                 ).fetchall()
                 deleted_conversations = len(conversation_delete_row)
             else:
-                orphan_rows = conn.execute(
-                    """
+                orphan_sql = """
                     DELETE FROM conversations c
                     WHERE c.user_id = %s
+                """
+                orphan_params: tuple[Any, ...] = (user_id,)
+                if channel is not None:
+                    orphan_sql += " AND c.channel = %s"
+                    orphan_params += (channel,)
+                orphan_sql += """
                       AND NOT EXISTS (
                           SELECT 1 FROM messages m WHERE m.conversation_id = c.id
                       )
@@ -349,9 +442,8 @@ class Repository:
                           SELECT 1 FROM tool_calls t WHERE t.conversation_id = c.id
                       )
                     RETURNING id
-                    """,
-                    (user_id,),
-                ).fetchall()
+                    """
+                orphan_rows = conn.execute(orphan_sql, orphan_params).fetchall()
                 deleted_conversations = len(orphan_rows)
 
             return {
@@ -359,13 +451,14 @@ class Repository:
                     "messages": message_count,
                     "summaries": summary_count,
                     "memories": len(memory_ids),
+                    "context_messages": len(context_ids),
                     "documents": len(document_ids),
                     "document_chunks": len(document_chunk_ids),
                     "tool_calls": tool_call_count,
                     "conversations": deleted_conversations,
                 },
                 "memory_point_ids": memory_point_ids,
-                "document_point_ids": document_point_ids,
+                "document_point_ids": document_point_ids + context_point_ids,
             }
 
     @staticmethod

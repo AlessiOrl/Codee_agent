@@ -11,21 +11,18 @@ class Source(BaseModel):
 class ChatRequest(BaseModel):
     telegram_user_id: str
     telegram_chat_id: str
+    channel: str = "private"
     telegram_message_id: str | None = None
     username: str | None = None
     first_name: str | None = None
     text: str = Field(min_length=1)
 
 
-class ChatResponse(BaseModel):
-    reply: str
-    conversation_id: UUID
-    sources: list[Source] = Field(default_factory=list)
-
-
 class ForgetRequest(BaseModel):
     telegram_user_id: str
     telegram_chat_id: str
+    channel: str
+    scope: str = Field(default="channel", pattern="^(channel|all)$")
     days: int | None = Field(default=None, ge=1)
 
 
@@ -33,6 +30,7 @@ class ForgetCounts(BaseModel):
     messages: int = 0
     summaries: int = 0
     memories: int = 0
+    context_messages: int = 0
     documents: int = 0
     document_chunks: int = 0
     tool_calls: int = 0
@@ -48,12 +46,28 @@ class ForgetResponse(BaseModel):
 class SummaryRequest(BaseModel):
     telegram_user_id: str
     telegram_chat_id: str
+    channel: str = "private"
 
 
 class SummaryResponse(BaseModel):
     reply: str
     summary: str | None = None
     summary_created_at: str | None = None
+
+
+class ContextMessageRequest(BaseModel):
+    telegram_user_id: str
+    telegram_chat_id: str
+    channel: str = Field(pattern="^(domotics|unraid|plex)$")
+    text: str = Field(min_length=1)
+    telegram_message_id: str | None = None
+    username: str | None = None
+    first_name: str | None = None
+
+
+class ContextMessageResponse(BaseModel):
+    status: str
+    message_id: UUID
 
 
 class DebugLlmRequest(BaseModel):

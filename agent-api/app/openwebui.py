@@ -32,6 +32,10 @@ def _openwebui_error(exc: httpx.HTTPError) -> OpenWebUIError:
     return OpenWebUIError(f"Open WebUI request failed: {exc}")
 
 
+def _error_detail(exc: BaseException) -> str:
+    return str(exc).replace("\n", " ")[:300]
+
+
 def _source_documents(data: dict[str, Any]) -> list[dict[str, Any]]:
     documents: list[dict[str, Any]] = []
     for source in data.get("sources", []):
@@ -121,7 +125,7 @@ class OpenWebUIClient:
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"}
 
-    def chat(self, messages: list[dict[str, str]]) -> LlmResult:
+    def chat(self, messages: list[dict[str, str]], *, use_web_search: bool | None = None) -> LlmResult:
         last_error: OpenWebUIError | None = None
         routes = self._chat_routes_for_request()
         for index, route in enumerate(routes):
@@ -130,12 +134,17 @@ class OpenWebUIClient:
                     messages,
                     base_url=route["base_url"],
                     model=route["model"],
+                    use_web_search=self.use_web_search if use_web_search is None else use_web_search,
                 )
             except OpenWebUIError as exc:
                 last_error = exc
                 if index < len(routes) - 1:
                     LOGGER.warning(
-                        "Open WebUI chat model failed; trying next configured model"
+                        "Open WebUI chat failed route=%s model=%s url=%s; trying next route: %s",
+                        index + 1,
+                        route["model"],
+                        route["base_url"],
+                        _error_detail(exc),
                     )
                     continue
                 raise
@@ -143,14 +152,26 @@ class OpenWebUIClient:
             raise last_error
         raise OpenWebUIError("No Open WebUI model configured")
 
-    def _chat_with_model(self, messages: list[dict[str, str]], *, base_url: str, model: str) -> LlmResult:
+    def _chat_with_model(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        base_url: str,
+        model: str,
+        use_web_search: bool,
+    ) -> LlmResult:
         chat_id: str | None = None
         client = httpx.Client(timeout=self.timeout_seconds, headers=self.headers)
         try:
             try:
                 chat_id = self._create_chat(client, base_url=base_url, model=model)
-            except OpenWebUIError:
-                LOGGER.info("Open WebUI chat creation failed; continuing without chat_id")
+            except OpenWebUIError as exc:
+                LOGGER.info(
+                    "Open WebUI chat creation failed url=%s model=%s; continuing without chat_id: %s",
+                    base_url,
+                    model,
+                    _error_detail(exc),
+                )
 
             payload: dict[str, Any] = {
                 "model": model,
@@ -160,14 +181,21 @@ class OpenWebUIClient:
             if chat_id:
                 payload["chat_id"] = chat_id
                 payload["parent_id"] = None
-            if self.use_web_search:
+            if use_web_search:
                 payload["tool_ids"] = ["web_search"]
 
             try:
                 response = client.post(f"{base_url}/api/chat/completions", json=payload)
                 response.raise_for_status()
             except httpx.HTTPError as exc:
-                raise _openwebui_error(exc) from exc
+                error = _openwebui_error(exc)
+                LOGGER.warning(
+                    "Open WebUI chat completion request failed url=%s model=%s: %s",
+                    base_url,
+                    model,
+                    _error_detail(error),
+                )
+                raise error from exc
             data = response.json()
             return LlmResult(
                 content=extract_content(data),
@@ -179,7 +207,12 @@ class OpenWebUIClient:
             if chat_id:
                 self._delete_chat(base_url=base_url, chat_id=chat_id)
 
-    def stream_chat(self, messages: list[dict[str, str]]) -> Iterator[dict[str, Any]]:
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        use_web_search: bool | None = None,
+    ) -> Iterator[dict[str, Any]]:
         last_error: OpenWebUIError | None = None
         routes = self._chat_routes_for_request()
         for index, route in enumerate(routes):
@@ -189,6 +222,7 @@ class OpenWebUIClient:
                     messages,
                     base_url=route["base_url"],
                     model=route["model"],
+                    use_web_search=self.use_web_search if use_web_search is None else use_web_search,
                 ):
                     if event.get("type") == "delta":
                         emitted_delta = True
@@ -198,7 +232,11 @@ class OpenWebUIClient:
                 last_error = exc
                 if index < len(routes) - 1 and not emitted_delta:
                     LOGGER.warning(
-                        "Open WebUI stream model failed before content; trying next configured model"
+                        "Open WebUI stream failed before content route=%s model=%s url=%s; trying next route: %s",
+                        index + 1,
+                        route["model"],
+                        route["base_url"],
+                        _error_detail(exc),
                     )
                     continue
                 raise
@@ -212,6 +250,7 @@ class OpenWebUIClient:
         *,
         base_url: str,
         model: str,
+        use_web_search: bool,
     ) -> Iterator[dict[str, Any]]:
         chat_id: str | None = None
         client = httpx.Client(timeout=self.timeout_seconds, headers=self.headers)
@@ -220,8 +259,13 @@ class OpenWebUIClient:
         try:
             try:
                 chat_id = self._create_chat(client, base_url=base_url, model=model)
-            except OpenWebUIError:
-                LOGGER.info("Open WebUI chat creation failed; continuing without chat_id")
+            except OpenWebUIError as exc:
+                LOGGER.info(
+                    "Open WebUI chat creation failed url=%s model=%s; continuing without chat_id: %s",
+                    base_url,
+                    model,
+                    _error_detail(exc),
+                )
 
             payload: dict[str, Any] = {
                 "model": model,
@@ -231,7 +275,7 @@ class OpenWebUIClient:
             if chat_id:
                 payload["chat_id"] = chat_id
                 payload["parent_id"] = None
-            if self.use_web_search:
+            if use_web_search:
                 payload["tool_ids"] = ["web_search"]
 
             try:
@@ -263,7 +307,14 @@ class OpenWebUIClient:
                         if extracted_sources:
                             sources = extracted_sources
             except httpx.HTTPError as exc:
-                raise _openwebui_error(exc) from exc
+                error = _openwebui_error(exc)
+                LOGGER.warning(
+                    "Open WebUI stream request failed url=%s model=%s: %s",
+                    base_url,
+                    model,
+                    _error_detail(error),
+                )
+                raise error from exc
 
             yield {
                 "type": "done",
@@ -283,7 +334,14 @@ class OpenWebUIClient:
                 response.raise_for_status()
                 data = response.json()
         except httpx.HTTPError as exc:
-            raise _openwebui_error(exc) from exc
+            error = _openwebui_error(exc)
+            LOGGER.warning(
+                "Open WebUI embedding request failed url=%s model=%s: %s",
+                self.base_url,
+                self.embedding_model,
+                _error_detail(error),
+            )
+            raise error from exc
         if isinstance(data.get("embedding"), list):
             return [float(value) for value in data["embedding"]]
         if isinstance(data.get("data"), list) and data["data"]:
@@ -311,7 +369,10 @@ class OpenWebUIClient:
         if self._ollama_status_succeeds():
             return routes
         LOGGER.warning(
-            "Primary Ollama did not pass fast status check; trying fallback model before primary model"
+            "Primary Ollama did not pass fast status check url=%s; trying fallback model=%s before primary model=%s",
+            self.ollama_base_url,
+            routes[1]["model"],
+            routes[0]["model"],
         )
         return [routes[1], routes[0]]
 
@@ -328,7 +389,7 @@ class OpenWebUIClient:
                 response = client.get(f"{self.ollama_base_url}/api/tags")
                 response.raise_for_status()
         except httpx.HTTPError as exc:
-            LOGGER.warning("Ollama status check failed at %s: %s", self.ollama_base_url, exc)
+            LOGGER.warning("Ollama status check failed url=%s endpoint=/api/tags: %s", self.ollama_base_url, exc)
             return False
         return True
 
@@ -346,5 +407,10 @@ class OpenWebUIClient:
             with httpx.Client(timeout=self.timeout_seconds, headers=self.headers) as client:
                 response = client.delete(f"{base_url}/api/v1/chats/{chat_id}")
                 response.raise_for_status()
-        except httpx.HTTPError:
-            LOGGER.warning("Failed to delete temporary Open WebUI chat %s", chat_id)
+        except httpx.HTTPError as exc:
+            LOGGER.warning(
+                "Failed to delete temporary Open WebUI chat url=%s chat_id=%s: %s",
+                base_url,
+                chat_id,
+                exc,
+            )

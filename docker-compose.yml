@@ -1,10 +1,23 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+    max-file: ${DOCKER_LOG_MAX_FILE:-3}
+
 services:
   postgres:
     image: postgres:16
+    command:
+      - postgres
+      - -c
+      - log_min_messages=${POSTGRES_LOG_MIN_MESSAGES:-warning}
+      - -c
+      - log_min_error_statement=${POSTGRES_LOG_MIN_ERROR_STATEMENT:-error}
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-agent}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agent_password}
       POSTGRES_DB: ${POSTGRES_DB:-agent_db}
+    logging: *default-logging
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -17,6 +30,10 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.12.4
+    environment:
+      RUST_LOG: ${QDRANT_LOG_LEVEL:-warn}
+      QDRANT__LOG_LEVEL: ${QDRANT_LOG_LEVEL:-warn}
+    logging: *default-logging
     volumes:
       - qdrant_data:/qdrant/storage
     ports:
@@ -31,6 +48,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://agent:agent_password@postgres:5432/agent_db}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    logging: *default-logging
     ports:
       - "8000:8000"
     depends_on:
@@ -54,6 +72,7 @@ services:
       AGENT_API_KEY: ${AGENT_API_KEY:-change_me_agent_api_key}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    logging: *default-logging
     depends_on:
       agent-api:
         condition: service_healthy

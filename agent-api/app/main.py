@@ -19,7 +19,8 @@ from app.openwebui import OpenWebUIClient, OpenWebUIError
 from app.repository import Repository
 from app.schemas import (
     ChatRequest,
-    ChatResponse,
+    ContextMessageRequest,
+    ContextMessageResponse,
     DebugEmbeddingRequest,
     DebugEmbeddingResponse,
     DebugLlmRequest,
@@ -34,6 +35,16 @@ from app.schemas import (
 from app.summary import SummaryService
 from app.vector_store import VectorStore, VectorStoreError
 
+
+def context_debug_json(event: str, payload: dict) -> None:
+    if not bool(getattr(app.state, "context_debug_json", False)):
+        return
+    LOGGER.info(
+        "context_debug_json %s",
+        json.dumps({"event": event, **payload}, default=str, ensure_ascii=False, sort_keys=True),
+    )
+
+
 class HealthAccessLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return "/health" not in str(record.getMessage())
@@ -42,12 +53,17 @@ class HealthAccessLogFilter(logging.Filter):
 def configure_logging() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(levelname)s:%(name)s:%(message)s",
+        format="%(levelname).1s %(name)s | %(message)s",
+        force=True,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("qdrant_client").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").addFilter(HealthAccessLogFilter())
+    logging.getLogger("uvicorn.error").propagate = False
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.propagate = False
+    if not any(isinstance(filter_, HealthAccessLogFilter) for filter_ in access_logger.filters):
+        access_logger.addFilter(HealthAccessLogFilter())
 
 
 configure_logging()
@@ -102,6 +118,7 @@ async def lifespan(app: FastAPI):
     app.state.repository = repository
     app.state.vector_store = vector_store
     app.state.llm = llm
+    app.state.context_debug_json = settings.context_debug_json
     app.state.agent_graph = AgentGraph(
         repository=repository,
         vector_store=vector_store,
@@ -109,6 +126,13 @@ async def lifespan(app: FastAPI):
         system_prompt=settings.system_prompt,
         recent_history_limit=settings.recent_history_limit,
         summary_every_n_messages=settings.summary_every_n_messages,
+        cross_channel_memory_limit=settings.cross_channel_memory_limit,
+        cross_channel_doc_limit=settings.cross_channel_doc_limit,
+        cross_channel_min_score=settings.cross_channel_min_score,
+        context_router_enabled=settings.context_router_enabled,
+        context_router_max_feed_messages=settings.context_router_max_feed_messages,
+        context_router_min_confidence=settings.context_router_min_confidence,
+        context_debug_json=settings.context_debug_json,
     )
     app.state.document_service = DocumentService(
         repository=repository,
@@ -165,19 +189,6 @@ async def debug_embedding(request: DebugEmbeddingRequest) -> DebugEmbeddingRespo
     return DebugEmbeddingResponse(dimensions=len(vector), sample=vector[:5])
 
 
-@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
-async def chat(request: ChatRequest) -> ChatResponse:
-    try:
-        state = await asyncio.to_thread(app.state.agent_graph.invoke, request.model_dump())
-    except (EmbeddingError, OpenWebUIError, VectorStoreError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return ChatResponse(
-        reply=state["reply"],
-        conversation_id=state["conversation"]["id"],
-        sources=state.get("sources", []),
-    )
-
-
 @app.post("/chat/stream", dependencies=[Depends(require_api_key)])
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
     def events():
@@ -200,7 +211,9 @@ async def forget(request: ForgetRequest) -> ForgetResponse:
             app.state.forget_service.forget,
             telegram_user_id=request.telegram_user_id,
             telegram_chat_id=request.telegram_chat_id,
+            channel=request.channel,
             days=request.days,
+            scope=request.scope,
         )
     except VectorStoreError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -213,8 +226,70 @@ async def summary(request: SummaryRequest) -> SummaryResponse:
         app.state.summary_service.get_summary,
         telegram_user_id=request.telegram_user_id,
         telegram_chat_id=request.telegram_chat_id,
+        channel=request.channel,
     )
     return SummaryResponse(**result)
+
+
+@app.post(
+    "/context/messages",
+    response_model=ContextMessageResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def ingest_context_message(request: ContextMessageRequest) -> ContextMessageResponse:
+    repository: Repository = app.state.repository
+    context_debug_json(
+        "context_ingest_request",
+        {
+            "telegram_user_id": request.telegram_user_id,
+            "telegram_chat_id": request.telegram_chat_id,
+            "telegram_message_id": request.telegram_message_id,
+            "channel": request.channel,
+            "username": request.username,
+            "first_name": request.first_name,
+            "text": request.text,
+        },
+    )
+    user = await asyncio.to_thread(
+        repository.upsert_user,
+        telegram_user_id=request.telegram_user_id,
+        username=request.username,
+        first_name=request.first_name,
+    )
+    try:
+        point_id = await asyncio.to_thread(
+            app.state.vector_store.upsert_context_message,
+            user_id=user["id"],
+            channel=request.channel,
+            telegram_chat_id=request.telegram_chat_id,
+            telegram_message_id=request.telegram_message_id,
+            content=request.text,
+        )
+    except (EmbeddingError, VectorStoreError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    message = await asyncio.to_thread(
+        repository.save_context_message,
+        user_id=user["id"],
+        channel=request.channel,
+        telegram_chat_id=request.telegram_chat_id,
+        telegram_message_id=request.telegram_message_id,
+        content=request.text,
+        qdrant_point_id=point_id,
+    )
+    context_debug_json(
+        "context_ingest_stored",
+        {
+            "telegram_user_id": request.telegram_user_id,
+            "db_user_id": str(user["id"]),
+            "telegram_chat_id": request.telegram_chat_id,
+            "telegram_message_id": request.telegram_message_id,
+            "channel": request.channel,
+            "context_message_id": str(message["id"]),
+            "qdrant_point_id": point_id,
+        },
+    )
+    return ContextMessageResponse(status="stored", message_id=message["id"])
 
 
 @app.post(
@@ -225,6 +300,7 @@ async def summary(request: SummaryRequest) -> SummaryResponse:
 async def upload_document(
     telegram_user_id: Annotated[str, Form()],
     telegram_chat_id: Annotated[str | None, Form()] = None,
+    channel: Annotated[str | None, Form()] = None,
     username: Annotated[str | None, Form()] = None,
     first_name: Annotated[str | None, Form()] = None,
     file: UploadFile = File(),
@@ -242,10 +318,13 @@ async def upload_document(
     )
     conversation = None
     if telegram_chat_id:
+        if not channel:
+            raise HTTPException(status_code=400, detail="channel is required when telegram_chat_id is provided")
         conversation = await asyncio.to_thread(
             repository.upsert_conversation,
             user_id=user["id"],
             telegram_chat_id=telegram_chat_id,
+            channel=channel,
         )
 
     try:
@@ -253,6 +332,7 @@ async def upload_document(
             app.state.document_service.ingest,
             user_id=user["id"],
             conversation_id=conversation["id"] if conversation else None,
+            channel=channel,
             filename=file.filename or "upload",
             mime_type=file.content_type,
             content=content,

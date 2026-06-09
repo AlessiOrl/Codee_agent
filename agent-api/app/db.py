@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     telegram_chat_id TEXT NOT NULL,
+    channel TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (user_id, telegram_chat_id)
@@ -38,6 +39,20 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
 ON messages (conversation_id, created_at);
 
+CREATE TABLE IF NOT EXISTS context_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    telegram_chat_id TEXT NOT NULL,
+    telegram_message_id TEXT,
+    content TEXT NOT NULL,
+    qdrant_point_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_messages_user_channel_created
+ON context_messages (user_id, channel, created_at);
+
 CREATE TABLE IF NOT EXISTS conversation_summaries (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -50,6 +65,8 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
 CREATE TABLE IF NOT EXISTS memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL,
+    channel TEXT,
     memory_type TEXT NOT NULL,
     content TEXT NOT NULL,
     qdrant_point_id TEXT,
@@ -86,6 +103,26 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     status TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS channel TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS channel TEXT;
+UPDATE conversations
+SET channel = telegram_chat_id
+WHERE channel IS NULL;
+UPDATE memories AS m
+SET conversation_id = c.id,
+    channel = c.channel
+FROM conversations AS c
+WHERE m.conversation_id IS NULL
+  AND m.channel IS NULL
+  AND c.user_id = m.user_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_user_channel
+ON conversations (user_id, channel);
+CREATE INDEX IF NOT EXISTS idx_conversations_channel
+ON conversations (channel);
+CREATE INDEX IF NOT EXISTS idx_memories_user_channel
+ON memories (user_id, channel);
 """
 
 

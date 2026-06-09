@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     recent_history_limit: int = Field(default=20, alias="RECENT_HISTORY_LIMIT")
     summary_every_n_messages: int = Field(default=12, alias="SUMMARY_EVERY_N_MESSAGES")
     max_document_chars: int = Field(default=200000, alias="MAX_DOCUMENT_CHARS")
+    cross_channel_memory_limit: int = Field(default=3, alias="CROSS_CHANNEL_MEMORY_LIMIT")
+    cross_channel_doc_limit: int = Field(default=2, alias="CROSS_CHANNEL_DOC_LIMIT")
+    cross_channel_min_score: float = Field(default=0.6, alias="CROSS_CHANNEL_MIN_SCORE")
+    context_router_enabled: bool = Field(default=True, alias="CONTEXT_ROUTER_ENABLED")
+    context_router_max_feed_messages: int = Field(default=6, alias="CONTEXT_ROUTER_MAX_FEED_MESSAGES")
+    context_router_min_confidence: float = Field(default=0.4, alias="CONTEXT_ROUTER_MIN_CONFIDENCE")
+    context_debug_json: bool = Field(default=False, alias="CONTEXT_DEBUG_JSON")
 
 
 @lru_cache

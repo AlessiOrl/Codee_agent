@@ -38,6 +38,11 @@ class Settings:
     telegram_timeout_seconds: float
     agent_timeout_seconds: float
     state_path: Path
+    domotics_chat_id: str
+    unraid_chat_id: str
+    plex_chat_id: str
+    context_owner_telegram_user_id: str
+    context_debug_json: bool
 
 
 def env_float(name: str, default: float) -> float:
@@ -49,6 +54,13 @@ def env_float(name: str, default: float) -> float:
     except ValueError:
         LOGGER.warning("Invalid %s=%r; using default %s", name, value, default)
         return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
@@ -67,7 +79,19 @@ def load_settings() -> Settings:
         telegram_timeout_seconds=env_float("TELEGRAM_TIMEOUT_SECONDS", 30.0),
         agent_timeout_seconds=env_float("AGENT_API_TIMEOUT_SECONDS", 180.0),
         state_path=Path(os.getenv("TELEGRAM_STATE_PATH", "/data/telegram_offset.json")),
+        domotics_chat_id=require_env("DOMOTICS_CHAT_ID"),
+        unraid_chat_id=require_env("UNRAID_CHAT_ID"),
+        plex_chat_id=require_env("PLEX_CHAT_ID"),
+        context_owner_telegram_user_id=require_env("CONTEXT_OWNER_TELEGRAM_USER_ID"),
+        context_debug_json=env_bool("CONTEXT_DEBUG_JSON", False),
     )
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
 
 
 class OffsetStore:
@@ -99,6 +123,15 @@ class TelegramBot:
         self.offset_store = OffsetStore(settings.state_path)
         self.telegram_base_url = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
         self.offset = self.offset_store.load()
+
+    def resolve_channel(self, chat_id: Any) -> str | None:
+        chat_id_text = str(chat_id)
+        mapping = {
+            self.settings.domotics_chat_id: "domotics",
+            self.settings.unraid_chat_id: "unraid",
+            self.settings.plex_chat_id: "plex",
+        }
+        return mapping.get(chat_id_text)
 
     def run_forever(self) -> None:
         LOGGER.info(
@@ -132,7 +165,7 @@ class TelegramBot:
     def get_updates(self) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "timeout": 0,
-            "allowed_updates": json.dumps(["message"]),
+            "allowed_updates": json.dumps(["message", "channel_post"]),
         }
         if self.offset is not None:
             params["offset"] = self.offset
@@ -155,7 +188,7 @@ class TelegramBot:
 
     def handle_update(self, update: dict[str, Any]) -> None:
         update_id = update.get("update_id")
-        message = update.get("message")
+        message = update.get("message") or update.get("channel_post")
         if not isinstance(message, dict):
             LOGGER.info("Ignoring non-message update_id=%s", update_id)
             return
@@ -164,6 +197,27 @@ class TelegramBot:
         chat_id = chat.get("id")
         if chat_id is None:
             LOGGER.warning("Ignoring message without chat id update_id=%s", update_id)
+            return
+
+        channel = self.resolve_channel(chat_id)
+        self.debug_json(
+            "telegram_update_route",
+            {
+                "update_id": update_id,
+                "telegram_chat_id": str(chat_id),
+                "chat_type": chat.get("type"),
+                "resolved_channel": channel,
+                "message_id": message.get("message_id"),
+                "has_text": isinstance(message.get("text"), str),
+                "is_channel_post": "channel_post" in update,
+            },
+        )
+        if channel is not None:
+            self.call_context_ingest(message, channel=channel)
+            return
+
+        if chat.get("type") != "private":
+            LOGGER.warning("Ignoring unmapped non-private chat_id=%s update_id=%s", chat_id, update_id)
             return
 
         text = message.get("text")
@@ -176,53 +230,75 @@ class TelegramBot:
             command = command_name(text)
             LOGGER.info("Handling command update_id=%s command=%s", update_id, command)
             if command == "/forget":
-                self.send_message(chat_id, self.call_forget(message))
+                self.send_message(chat_id, self.call_forget(message, channel="private", scope="channel"))
+            elif command == "/forget_all":
+                self.send_message(chat_id, self.call_forget(message, channel="private", scope="all"))
             elif command == "/summary":
-                self.send_message(chat_id, self.call_summary(message))
+                self.send_message(chat_id, self.call_summary(message, channel="private"))
             else:
                 self.send_message(chat_id, command_reply(text, message))
             return
 
         LOGGER.info("Forwarding text update_id=%s chat_id=%s to agent-api", update_id, chat_id)
-        if self.stream_agent_reply(message):
-            return
-        reply = self.call_agent(message)
-        self.send_message(chat_id, reply)
+        if not self.stream_agent_reply(message, channel="private"):
+            self.send_message(chat_id, "Codee could not start a streaming reply. Please try again.")
 
-    def call_agent(self, message: dict[str, Any]) -> str:
-        payload = agent_payload(message)
+    def call_context_ingest(self, message: dict[str, Any], *, channel: str) -> bool:
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip():
+            LOGGER.info("Ignoring non-text passive context message channel=%s", channel)
+            return False
+
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        payload = {
+            "telegram_user_id": self.settings.context_owner_telegram_user_id,
+            "telegram_chat_id": str(chat.get("id")),
+            "channel": channel,
+            "telegram_message_id": str(message.get("message_id")) if message.get("message_id") is not None else None,
+            "username": user.get("username"),
+            "first_name": user.get("first_name"),
+            "text": text,
+        }
+        self.debug_json(
+            "context_ingest_post",
+            {
+                "url": f"{self.settings.agent_api_url}/context/messages",
+                "payload": payload,
+            },
+        )
         headers = {"Authorization": f"Bearer {self.settings.agent_api_key}"}
         try:
             with httpx.Client(timeout=self.settings.agent_timeout_seconds) as client:
                 response = client.post(
-                    f"{self.settings.agent_api_url}/chat",
+                    f"{self.settings.agent_api_url}/context/messages",
                     headers=headers,
                     json=payload,
                 )
                 response.raise_for_status()
-                data = response.json()
-        except httpx.HTTPStatusError as exc:
-            LOGGER.warning(
-                "agent-api returned HTTP %s: %s",
-                exc.response.status_code,
-                exc.response.text[:500],
-            )
-            return "Codee hit an API error while answering. Please try again."
         except httpx.HTTPError as exc:
-            LOGGER.warning("agent-api request failed: %s", exc)
-            return "Codee could not reach the agent service. Please try again."
-        except (json.JSONDecodeError, ValueError) as exc:
-            LOGGER.warning("agent-api returned an invalid response: %s", exc)
-            return "Codee received an invalid agent response. Please try again."
+            LOGGER.warning("agent-api /context/messages request failed channel=%s: %s", channel, exc)
+            return False
+        self.debug_json(
+            "context_ingest_response",
+            {
+                "channel": channel,
+                "telegram_chat_id": str(chat.get("id")),
+                "status_code": response.status_code,
+            },
+        )
+        LOGGER.info("Stored passive context message channel=%s chat_id=%s", channel, chat.get("id"))
+        return True
 
-        reply = data.get("reply")
-        if not isinstance(reply, str) or not reply.strip():
-            LOGGER.warning("agent-api response missing reply")
-            return "Codee did not return a reply. Please try again."
-        sources = data.get("sources")
-        return inject_source_citations(reply, sources if isinstance(sources, list) else [])
+    def debug_json(self, event: str, payload: dict[str, Any]) -> None:
+        if not self.settings.context_debug_json:
+            return
+        LOGGER.info(
+            "context_debug_json %s",
+            json.dumps({"event": event, **payload}, default=str, ensure_ascii=False, sort_keys=True),
+        )
 
-    def stream_agent_reply(self, message: dict[str, Any]) -> bool:
+    def stream_agent_reply(self, message: dict[str, Any], *, channel: str) -> bool:
         user = message.get("from") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
@@ -234,7 +310,7 @@ class TelegramBot:
         if message_id is None:
             return False
 
-        payload = agent_payload(message)
+        payload = agent_payload(message, channel=channel)
         headers = {"Authorization": f"Bearer {self.settings.agent_api_key}"}
         accumulated = ""
         sources: list[dict[str, Any]] = []
@@ -289,8 +365,12 @@ class TelegramBot:
                             message_text = event.get("message")
                             LOGGER.warning("agent-api streaming error: %s", message_text)
                             if not accumulated:
-                                fallback = self.call_agent(message)
-                                self.edit_message(chat_id, message_id, fallback, markdown=True)
+                                self.edit_message(
+                                    chat_id,
+                                    message_id,
+                                    "Codee hit an API error while streaming. Please try again.",
+                                    markdown=False,
+                                )
                                 return True
                             self.edit_message(
                                 chat_id,
@@ -316,12 +396,16 @@ class TelegramBot:
                 markdown=False,
             )
             return True
-        fallback = self.call_agent(message)
-        self.edit_message(chat_id, message_id, fallback, markdown=True)
+        self.edit_message(
+            chat_id,
+            message_id,
+            "Codee could not reach the agent stream. Please try again.",
+            markdown=False,
+        )
         return True
 
-    def call_forget(self, message: dict[str, Any]) -> str:
-        parsed = parse_forget_command(message["text"])
+    def call_forget(self, message: dict[str, Any], *, channel: str, scope: str) -> str:
+        parsed = parse_forget_command(message["text"], expected_command="/forget_all" if scope == "all" else "/forget")
         if isinstance(parsed, str):
             return parsed
 
@@ -330,6 +414,8 @@ class TelegramBot:
         payload = {
             "telegram_user_id": str(user.get("id")),
             "telegram_chat_id": str(chat.get("id")),
+            "channel": channel,
+            "scope": scope,
             "days": parsed,
         }
         headers = {"Authorization": f"Bearer {self.settings.agent_api_key}"}
@@ -362,12 +448,13 @@ class TelegramBot:
             return "Codee did not confirm the forget request. Please try again."
         return reply
 
-    def call_summary(self, message: dict[str, Any]) -> str:
+    def call_summary(self, message: dict[str, Any], *, channel: str) -> str:
         user = message.get("from") or {}
         chat = message.get("chat") or {}
         payload = {
             "telegram_user_id": str(user.get("id")),
             "telegram_chat_id": str(chat.get("id")),
+            "channel": channel,
         }
         headers = {"Authorization": f"Bearer {self.settings.agent_api_key}"}
         try:
@@ -510,12 +597,13 @@ def command_name(text: str) -> str:
     return command.split("@", 1)[0]
 
 
-def agent_payload(message: dict[str, Any]) -> dict[str, Any]:
+def agent_payload(message: dict[str, Any], *, channel: str) -> dict[str, Any]:
     user = message.get("from") or {}
     chat = message.get("chat") or {}
     return {
         "telegram_user_id": str(user.get("id")),
         "telegram_chat_id": str(chat.get("id")),
+        "channel": channel,
         "telegram_message_id": str(message.get("message_id")) if message.get("message_id") is not None else None,
         "username": user.get("username"),
         "first_name": user.get("first_name"),
@@ -542,32 +630,34 @@ def help_reply() -> str:
         "Available commands:\n"
         "/start - show the welcome message\n"
         "/help - show this command list\n"
-        "/summary - show the current chat summary\n"
-        "/forget - remove all stored context for your user\n"
-        "/forget <days> - remove stored context from the last N days\n\n"
+        "/summary - show the private chat summary\n"
+        "/forget - remove stored private chat context\n"
+        "/forget <days> - remove private chat context from the last N days\n"
+        "/forget_all - remove all stored context for your user across every channel\n"
+        "/forget_all <days> - remove stored context from the last N days across every channel\n\n"
         "Send a normal text message to chat with Codee."
     )
 
 
-def parse_forget_command(text: str) -> int | None | str:
+def parse_forget_command(text: str, *, expected_command: str = "/forget") -> int | None | str:
     parts = text.strip().split()
     if not parts:
-        return "Usage: /forget or /forget <days>."
+        return f"Usage: {expected_command} or {expected_command} <days>."
 
     command = command_name(parts[0])
-    if command != "/forget":
-        return "Usage: /forget or /forget <days>."
+    if command != expected_command:
+        return f"Usage: {expected_command} or {expected_command} <days>."
 
     if len(parts) == 1:
         return None
     if len(parts) != 2:
-        return "Usage: /forget or /forget <days>."
+        return f"Usage: {expected_command} or {expected_command} <days>."
     try:
         days = int(parts[1])
     except ValueError:
-        return "Usage: /forget <days>, where <days> is a positive integer."
+        return f"Usage: {expected_command} <days>, where <days> is a positive integer."
     if days < 1:
-        return "Usage: /forget <days>, where <days> is a positive integer."
+        return f"Usage: {expected_command} <days>, where <days> is a positive integer."
     return days
 
 
@@ -731,7 +821,8 @@ def escape_markdown_v2(text: str) -> str:
 def configure_logging() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(levelname).1s %(name)s | %(message)s",
+        force=True,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

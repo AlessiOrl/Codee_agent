@@ -41,6 +41,7 @@ class DocumentService:
         *,
         user_id: UUID,
         conversation_id: UUID | None,
+        channel: str | None,
         filename: str,
         mime_type: str | None,
         content: bytes,
@@ -63,6 +64,7 @@ class DocumentService:
             point_id = self.vector_store.upsert_document_chunk(
                 user_id=user_id,
                 conversation_id=conversation_id,
+                channel=channel,
                 document_id=document["id"],
                 chunk_id=placeholder["id"],
                 chunk_index=index,
