@@ -50,6 +50,18 @@ class FakeRepo:
         ]
 
 
+class FollowupRepo(FakeRepo):
+    def recent_messages(self, **kwargs):
+        return [
+            {"role": "user", "content": "There is a value stored in the Domotics notification chat, what is that number"},
+            {"role": "assistant", "content": "The number stored in the Domotics Debug test is 55."},
+            {"role": "user", "content": "Nice, now i want to know which f1 drivers with this number"},
+        ]
+
+    def latest_summary(self, **kwargs):
+        return None
+
+
 class FakeVector:
     def __init__(self) -> None:
         self.search_calls = 0
@@ -82,6 +94,16 @@ class EmptyContextVector(FakeVector):
     def search_context_messages(self, **kwargs):
         self.search_calls += 1
         self.context_search_calls.append(kwargs)
+        return []
+
+
+class NoPrivateContextVector(EmptyContextVector):
+    def search_memories(self, **kwargs):
+        self.search_calls += 1
+        return []
+
+    def search_documents(self, **kwargs):
+        self.search_calls += 1
         return []
 
 
@@ -137,7 +159,7 @@ def test_graph_invocation_saves_user_and_assistant_messages() -> None:
         cross_channel_memory_limit=3,
         cross_channel_doc_limit=2,
         cross_channel_min_score=0.6,
-        context_router_enabled=True,
+        context_router_enabled=False,
         context_router_max_feed_messages=6,
         context_router_min_confidence=0.4,
         context_debug_json=False,
@@ -250,6 +272,46 @@ def test_selected_feed_uses_recent_messages_when_semantic_search_is_empty() -> N
     assert "Use web search only after the provided context does not contain the answer" in answer_prompt
     assert "Selected passive feed context" in answer_prompt
     assert "The stored number is 42." in answer_prompt
+
+
+def test_followup_web_question_resolves_number_from_recent_transcript() -> None:
+    repo = FollowupRepo()
+    llm = FakeLlm()
+    graph = AgentGraph(
+        repository=repo,
+        vector_store=NoPrivateContextVector(),
+        llm=llm,
+        system_prompt="System prompt.",
+        recent_history_limit=20,
+        summary_every_n_messages=12,
+        cross_channel_memory_limit=3,
+        cross_channel_doc_limit=2,
+        cross_channel_min_score=0.6,
+        context_router_enabled=False,
+        context_router_max_feed_messages=6,
+        context_router_min_confidence=0.4,
+        context_debug_json=False,
+    )
+
+    state = graph.invoke(
+        {
+            "telegram_user_id": "1",
+            "telegram_chat_id": "2",
+            "channel": "private",
+            "telegram_message_id": "3",
+            "username": "orlando",
+            "first_name": "Orlando",
+            "text": "Nice, now i want to know which f1 drivers with this number",
+        }
+    )
+
+    answer_prompt = llm.calls[0][0]["content"]
+    assert state["reply"] == "final answer"
+    assert "Context priority rules" in answer_prompt
+    assert "Resolve follow-up references" in answer_prompt
+    assert "treat the number as 55" in answer_prompt
+    assert "grants permission to search" in answer_prompt
+    assert "use that value as the web search subject" in answer_prompt
 
 
 def test_telegram_command_does_not_call_llm_or_vector_search() -> None:

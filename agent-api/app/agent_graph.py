@@ -572,14 +572,15 @@ class AgentGraph:
             or state.get("memories")
             or state.get("documents")
             or state.get("context_messages")
+            or state.get("recent_messages")
         ):
             context_blocks.append(
                 "Context priority rules:\n"
-                "- First inspect and use the provided private chat context and selected passive feed context.\n"
-                "- If the user asks about a stored value in domotics, unraid, or plex, answer from the selected passive feed context when it contains the value.\n"
-                "- Do not replace a value found in the selected passive feed context with web search results, public websites, prior assistant guesses, or unrelated private memories.\n"
-                "- Use web search only after the provided context does not contain the answer, and clearly say when the answer came from web search instead of stored context.\n"
-                "- If the requested stored feed value is not present in the selected passive feed context, say it is not available in the provided stored context."
+                "- First inspect and use the provided private chat context, recent private transcript, and selected passive feed context.\n"
+                "- Resolve follow-up references from the recent private transcript before answering or searching.\n"
+                "- If the user asks about something in domotics, unraid, or plex, answer from the selected passive feed context when it contains the knowledge.\n"
+                "- Do not replace anything found in the selected passive feed context with web search results, public websites, prior assistant guesses, or unrelated private memories.\n"
+                "- Use web search only after the provided context and recent transcript do not contain the answer, and clearly say when the answer came from web search instead of stored context.\n"
             )
         if state.get("summary"):
             context_blocks.append(f"Private chat summary:\n{state['summary']}")
