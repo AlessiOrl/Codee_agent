@@ -1,1 +1,6 @@
 /.env
+/agent-api/app/__pycache__/
+/agent-api/tests/__pycache__/
+/postgres/*
+/telegram-bot/app/__pycache__/
+/telegram-bot/tests/__pycache__/
