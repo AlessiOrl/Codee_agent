@@ -23,10 +23,10 @@ docker compose up --build
 4. Smoke test:
 
 ```powershell
-curl.exe http://localhost:8000/health
+curl.exe http://localhost:8002/health
 $body = @{ text = "Reply with pong." } | ConvertTo-Json
 Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8000/debug/llm" `
+  -Uri "http://localhost:8002/debug/llm" `
   -Headers @{ Authorization = "Bearer change_me_agent_api_key" } `
   -ContentType "application/json" `
   -Body $body
