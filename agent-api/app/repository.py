@@ -152,19 +152,162 @@ class Repository:
         memory_type: str,
         qdrant_point_id: str,
         importance: int = 1,
+        confidence: float = 1.0,
+        source_user_message_id: UUID | None = None,
+        source_assistant_message_id: UUID | None = None,
+        source_text: str | None = None,
     ) -> dict[str, Any]:
         with self.db.connect() as conn:
             row = conn.execute(
                 """
                 INSERT INTO memories (
-                    user_id, conversation_id, channel, memory_type, content, qdrant_point_id, importance
+                    user_id,
+                    conversation_id,
+                    channel,
+                    memory_type,
+                    content,
+                    qdrant_point_id,
+                    importance,
+                    confidence,
+                    source_user_message_id,
+                    source_assistant_message_id,
+                    source_text
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (user_id, conversation_id, channel, memory_type, content, qdrant_point_id, importance),
+                (
+                    user_id,
+                    conversation_id,
+                    channel,
+                    memory_type,
+                    content,
+                    qdrant_point_id,
+                    importance,
+                    confidence,
+                    source_user_message_id,
+                    source_assistant_message_id,
+                    source_text,
+                ),
             ).fetchone()
             return dict(row)
+
+    def get_memory_by_content(
+        self,
+        *,
+        user_id: UUID,
+        channel: str | None,
+        content: str,
+    ) -> dict[str, Any] | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM memories
+                WHERE user_id = %s
+                  AND channel IS NOT DISTINCT FROM %s
+                  AND lower(content) = lower(%s)
+                LIMIT 1
+                """,
+                (user_id, channel, content),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def search_memories_keyword(
+        self,
+        *,
+        user_id: UUID,
+        query: str,
+        channels: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return self._keyword_search(
+            """
+            SELECT
+                id,
+                channel,
+                memory_type,
+                content,
+                importance,
+                confidence,
+                qdrant_point_id,
+                created_at,
+                ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', %s)) AS keyword_score
+            FROM memories
+            WHERE user_id = %s
+              AND to_tsvector('simple', content) @@ plainto_tsquery('simple', %s)
+            """,
+            query=query,
+            base_params=(query, user_id, query),
+            channels=channels,
+            channel_column="channel",
+            limit=limit,
+        )
+
+    def search_document_chunks_keyword(
+        self,
+        *,
+        user_id: UUID,
+        query: str,
+        channels: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return self._keyword_search(
+            """
+            SELECT
+                dc.id AS chunk_id,
+                dc.document_id,
+                dc.chunk_index,
+                dc.content,
+                dc.qdrant_point_id,
+                dc.created_at,
+                d.filename,
+                c.channel,
+                ts_rank_cd(to_tsvector('simple', dc.content), plainto_tsquery('simple', %s)) AS keyword_score
+            FROM document_chunks dc
+            JOIN documents d ON d.id = dc.document_id
+            LEFT JOIN conversations c ON c.id = d.conversation_id
+            WHERE d.user_id = %s
+              AND to_tsvector('simple', dc.content) @@ plainto_tsquery('simple', %s)
+            """,
+            query=query,
+            base_params=(query, user_id, query),
+            channels=channels,
+            channel_column="c.channel",
+            limit=limit,
+        )
+
+    def search_context_messages_keyword(
+        self,
+        *,
+        user_id: UUID,
+        channels: list[str],
+        query: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not channels:
+            return []
+        return self._keyword_search(
+            """
+            SELECT
+                id,
+                channel,
+                telegram_chat_id,
+                telegram_message_id,
+                content,
+                qdrant_point_id,
+                created_at,
+                ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', %s)) AS keyword_score
+            FROM context_messages
+            WHERE user_id = %s
+              AND to_tsvector('simple', content) @@ plainto_tsquery('simple', %s)
+            """,
+            query=query,
+            base_params=(query, user_id, query),
+            channels=channels,
+            channel_column="channel",
+            limit=limit,
+        )
 
     def create_document(
         self,
@@ -258,6 +401,28 @@ class Repository:
                 (user_id, channels, limit),
             ).fetchall()
             return [dict(row) for row in reversed(rows)]
+
+    def _keyword_search(
+        self,
+        sql: str,
+        *,
+        query: str,
+        base_params: tuple[Any, ...],
+        channels: list[str] | None,
+        channel_column: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0 or not query.strip():
+            return []
+        params = base_params
+        if channels:
+            sql += f" AND {channel_column} = ANY(%s)"
+            params += (channels,)
+        sql += " ORDER BY keyword_score DESC, created_at DESC LIMIT %s"
+        params += (limit,)
+        with self.db.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
 
     def forget_user_data(
         self,

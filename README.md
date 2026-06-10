@@ -117,8 +117,8 @@ Notes:
 
 - `agent-api`: FastAPI app with LangGraph orchestration.
 - `telegram-bot`: Python polling bot that receives Telegram messages and sends replies.
-- `postgres`: durable state for users, conversations, messages, summaries, memories, documents, and tool-call logs.
-- `qdrant`: vector store for user memories and document chunks.
+- `postgres`: durable state for users, conversations, messages, summaries, source-backed memories, documents, passive feed messages, and tool-call logs.
+- `qdrant`: vector store for user memories, document chunks, and passive feed messages.
 
 Open WebUI remains external. The agent calls its native API:
 
@@ -129,6 +129,8 @@ DELETE /api/v1/chats/{id}
 ```
 
 Embeddings default to local hash embeddings so the stack can run without an embedding service. Set `EMBEDDING_PROVIDER=ollama`, `OLLAMA_EMBEDDINGS_BASE_URL=...`, `EMBEDDING_MODEL=...`, and `VECTOR_SIZE=...` to call Ollama directly via `POST /api/embed`. Set `EMBEDDING_PROVIDER=openwebui` to use Open WebUI's `POST /api/embeddings` endpoint instead.
+
+Retrieval uses a hybrid local pipeline. Qdrant provides dense semantic candidates, Postgres full-text search provides keyword candidates, and `agent-api` reranks them with a deterministic score that combines semantic similarity, keyword overlap, recency, and memory importance. Passive feed retrieval still only happens after the LLM router selects `domotics`, `unraid`, or `plex`; keyword search never bypasses that router decision.
 
 If existing Qdrant collections were created with a different vector size, the app keeps them intact and creates dimension-specific collections such as `user_memories_2560` and `documents_2560`.
 
@@ -175,7 +177,7 @@ The `/summary` and `/forget` commands are scoped to the private chat. `/forget_a
 
 Any other slash command is handled locally.
 
-Normal private-chat text messages are forwarded to `POST /chat/stream`. Configured `domotics`, `unraid`, and `plex` chats are passive feeds only: the bot stores their messages through `POST /context/messages` and never replies there. For private chats, LangGraph first asks an LLM router whether any passive feed is relevant, retrieves only the selected feed messages, and labels that context in the prompt. The bot sends a typing action, creates a placeholder message, and edits that message as streamed text arrives. Chat responses use the streaming endpoint only. Final replies are sent with `parse_mode=MarkdownV2` so markdown-style replies, code fences, and clickable citations render correctly. If Telegram rejects the formatting, the bot automatically retries the final reply as plain text. Non-text messages in private chat receive a local unsupported-message reply.
+Normal private-chat text messages are forwarded to `POST /chat/stream`. Configured `domotics`, `unraid`, and `plex` chats are passive feeds only: the bot stores their messages through `POST /context/messages` and never replies there. For private chats, LangGraph first asks an LLM router whether any passive feed is relevant. Only the router-selected feeds are searched, then semantic, keyword, and recent-feed candidates are reranked into the prompt context. The bot sends a typing action, creates a placeholder message, and edits that message as streamed text arrives. Chat responses use the streaming endpoint only. Final replies are sent with `parse_mode=MarkdownV2` so markdown-style replies, code fences, and clickable citations render correctly. If Telegram rejects the formatting, the bot automatically retries the final reply as plain text. Non-text messages in private chat receive a local unsupported-message reply.
 
 Smoke test in Telegram:
 
@@ -189,7 +191,21 @@ Smoke test in Telegram:
 Reply with pong.
 ```
 
-Document upload support is implemented in `agent-api`, but the Python Telegram bot currently handles text only.
+Document upload support is implemented in `agent-api`, but the Python Telegram bot currently handles text only. Uploaded text and PDFs are chunked with structure-aware rules for headings, paragraphs, and log-style timestamps before falling back to overlapping fixed-size windows.
+
+## Retrieval Evaluation
+
+A small dependency-light retrieval evaluator is included for quick checks of hybrid ranking behavior:
+
+```powershell
+python agent-api\scripts\evaluate_retrieval.py
+```
+
+It prints JSON with `recall_at_k`, `mrr`, `context_precision`, and average ranking latency. You can pass a custom case file with:
+
+```powershell
+python agent-api\scripts\evaluate_retrieval.py --cases path\to\cases.json
+```
 
 ## Logs
 

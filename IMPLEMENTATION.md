@@ -39,8 +39,8 @@ flowchart LR
 - `agent-api` exposes FastAPI endpoints, initializes all dependencies during
   application startup, and runs the LangGraph response pipeline.
 - `postgres` stores durable relational state: users, conversations, messages,
-  summaries, memory metadata, document metadata, passive context messages, and
-  tool-call records.
+  summaries, source-backed memory metadata, document metadata, passive context
+  messages, keyword-search indexes, and tool-call records.
 - `qdrant` stores vectors for semantic retrieval. It is used for extracted
   memories, document chunks, and passive feed messages.
 - Open WebUI is called through its native API for chat generation, streaming,
@@ -117,10 +117,12 @@ sequenceDiagram
     A->>G: stream(request)
     G->>P: upsert user and conversation
     G->>P: save user message
-    G->>Q: retrieve memories and documents
+    G->>Q: semantic retrieve memories and documents
+    G->>P: keyword retrieve memories and documents
     G->>P: load summary and recent history
     G->>O: route passive context if needed
-    G->>Q: retrieve selected passive feed context
+    G->>Q: semantic retrieve selected passive feed context
+    G->>P: keyword and recent retrieve selected passive feed context
     G->>O: stream chat completion
     O-->>G: deltas and sources
     G-->>A: NDJSON delta events
@@ -197,6 +199,25 @@ Commands are treated specially. If the incoming text starts with `/`, vector
 search and LLM calls are skipped for command replies, and the assistant message
 is still saved.
 
+### Hybrid Retrieval and Reranking
+
+Private memories, private documents, and router-selected passive feed messages
+use the same local ranking pattern:
+
+1. Retrieve a wider candidate set from Qdrant using dense embeddings.
+2. Retrieve matching rows from Postgres full-text search using `simple`
+   `tsvector` indexes.
+3. Add recent passive feed rows for the router-selected feed channels.
+4. Merge duplicate hits by point id, chunk id, Telegram message id, or content.
+5. Filter candidates to the allowed channel and source type.
+6. Rerank with a deterministic hybrid score that combines semantic similarity,
+   keyword overlap, recency, and memory importance.
+
+This reranker lives in `agent-api/app/retrieval.py`. It does not call an LLM or
+external service. The passive-feed router remains the only component that can
+select `domotics`, `unraid`, or `plex`; hybrid retrieval operates only inside
+the channels returned by that router.
+
 ### Prompt Assembly
 
 The final prompt starts with `SYSTEM_PROMPT`, then appends context blocks when
@@ -214,6 +235,10 @@ private history, prefer stored passive feed context for `domotics`, `unraid`,
 and `plex` questions, and only use Open WebUI web search after stored context is
 insufficient.
 
+For follow-up questions that explicitly refer to "this number" or "that number",
+the prompt includes a small deterministic reference-resolution hint derived from
+the recent private assistant messages when a number is available.
+
 ### Memory Extraction
 
 After a normal assistant reply, the graph asks the LLM to extract durable facts,
@@ -221,9 +246,11 @@ preferences, project details, or recurring instructions from the latest exchange
 The expected response is JSON with a `memories` array. Up to five valid memories
 are:
 
-1. Embedded and upserted into Qdrant's user memory collection.
-2. Stored in Postgres with metadata including `memory_type`, `importance`,
-   conversation id, channel, and Qdrant point id.
+1. Deduplicated against existing memories for the same user and channel.
+2. Embedded and upserted into Qdrant's user memory collection.
+3. Stored in Postgres with metadata including `memory_type`, `importance`,
+   `confidence`, source user message id, source text, conversation id, channel,
+   and Qdrant point id.
 
 If extraction fails or returns invalid JSON, the chat response still succeeds.
 
@@ -261,7 +288,8 @@ sequenceDiagram
     A->>O: Ask router for relevant feeds
     O-->>A: JSON channels and confidence
     A->>Q: semantic search selected feeds
-    A->>P: fill remaining slots with recent feed rows
+    A->>P: keyword and recent search selected feeds
+    A->>A: rerank selected-feed candidates
     A->>O: generate answer with selected feed context
 ```
 
@@ -287,10 +315,12 @@ During private chat, the context router asks the LLM for strict JSON with:
 - `rationale`
 
 Only `domotics`, `unraid`, and `plex` are accepted. If confidence is below
-`CONTEXT_ROUTER_MIN_CONFIDENCE`, no passive feed is used. If semantic retrieval
-returns fewer than `CONTEXT_ROUTER_MAX_FEED_MESSAGES`, recent Postgres feed rows
-fill the remaining slots. Duplicate feed hits are removed by message id when
-available, otherwise by channel and content.
+`CONTEXT_ROUTER_MIN_CONFIDENCE`, no passive feed is used. When channels are
+selected, the API searches only those channels. Semantic Qdrant hits, Postgres
+keyword hits, and recent Postgres feed rows are merged, filtered to the selected
+channels, deduplicated, and reranked down to `CONTEXT_ROUTER_MAX_FEED_MESSAGES`.
+No keyword or vector retrieval path can add a passive feed channel that the
+router did not select.
 
 When `CONTEXT_ROUTER_ENABLED=false`, passive feed routing is skipped.
 
@@ -309,8 +339,11 @@ Ingestion steps:
    - PDF files use `pypdf.PdfReader`.
    - Other files are decoded as UTF-8 with replacement for invalid bytes.
 3. Truncate text to `MAX_DOCUMENT_CHARS`.
-4. Chunk text with a default chunk size of 1200 characters and 150 character
-   overlap.
+4. Chunk text with structure-aware rules:
+   - log-style timestamps are kept as entry boundaries when possible;
+   - Markdown-like headings and paragraph blocks are kept together when possible;
+   - long unstructured blocks fall back to 1200 character chunks with 150
+     character overlap.
 5. Create a Postgres `documents` row.
 6. Insert each chunk into Postgres with a temporary `pending` Qdrant point id.
 7. Embed and upsert each chunk into Qdrant.
@@ -334,14 +367,15 @@ It includes:
 - `messages`: user and assistant messages for private conversations.
 - `context_messages`: passive feed message records.
 - `conversation_summaries`: generated summaries over time.
-- `memories`: durable extracted memory metadata.
+- `memories`: durable extracted memory metadata, source evidence, importance,
+  confidence, and Qdrant point ids.
 - `documents`: uploaded document metadata.
 - `document_chunks`: extracted chunks and Qdrant point ids.
 - `tool_calls`: reserved storage for tool-call logging.
 
 Postgres is the durable source for relational lookup, deletion counts, recent
-history, recent feed fallback, and summary retrieval. Qdrant point ids are stored
-in Postgres so deletes can remove matching vectors later.
+history, keyword retrieval, recent feed fallback, and summary retrieval. Qdrant
+point ids are stored in Postgres so deletes can remove matching vectors later.
 
 ### Qdrant
 
@@ -361,7 +395,8 @@ does not delete or mutate it. Instead it creates a dimension-specific collection
 name such as `user_memories_2560` or `documents_2560`.
 
 All vector searches filter by `user_id`. Memory and document searches can also
-filter by channel.
+filter by channel. Real prompt context is assembled only after local hybrid
+reranking merges these vector hits with Postgres keyword candidates.
 
 ## Embeddings
 
@@ -461,6 +496,21 @@ The deletion pipeline:
 `/forget_all` in Telegram maps to the API's `scope = all`; `/forget` maps to
 `scope = channel`.
 
+## Retrieval Evaluation
+
+`agent-api/scripts/evaluate_retrieval.py` provides a small dependency-light
+golden-set evaluator for the local reranker. It can run with built-in examples:
+
+```powershell
+python agent-api\scripts\evaluate_retrieval.py
+```
+
+It reports JSON with average `recall_at_k`, `mrr`, `context_precision`, and
+ranking latency. A custom JSON case file can be supplied with `--cases`; each
+case contains a query, expected candidate ids, optional allowed channels, and
+candidate payloads. The script evaluates the same `hybrid_rerank()` function
+used by the application.
+
 ## Logging and Debugging
 
 Both Python services use compact one-line logging controlled by `LOG_LEVEL`.
@@ -477,7 +527,7 @@ Useful debug events include:
 - Telegram route decisions.
 - Passive context ingestion requests and responses.
 - Context router requests, parse failures, and selected channels.
-- Semantic and recent passive feed retrieval results.
+- Semantic, keyword, recent, and reranked passive feed retrieval results.
 - Final prompt context assembly.
 
 ## Error Handling

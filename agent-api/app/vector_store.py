@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -49,8 +50,13 @@ class VectorStore:
         content: str,
         memory_type: str,
         importance: int,
+        confidence: float = 1.0,
+        source_user_message_id: UUID | None = None,
+        source_assistant_message_id: UUID | None = None,
+        source_text: str | None = None,
     ) -> str:
         point_id = str(uuid4())
+        created_at = datetime.now(timezone.utc).isoformat()
         self.client.upsert(
             collection_name=self.user_memories_collection,
             points=[
@@ -64,6 +70,11 @@ class VectorStore:
                         "content": content,
                         "memory_type": memory_type,
                         "importance": importance,
+                        "confidence": confidence,
+                        "source_user_message_id": str(source_user_message_id) if source_user_message_id else None,
+                        "source_assistant_message_id": str(source_assistant_message_id) if source_assistant_message_id else None,
+                        "source_text": source_text,
+                        "created_at": created_at,
                     },
                 )
             ],
@@ -101,6 +112,7 @@ class VectorStore:
         content: str,
     ) -> str:
         point_id = str(uuid4())
+        created_at = datetime.now(timezone.utc).isoformat()
         self.client.upsert(
             collection_name=self.documents_collection,
             points=[
@@ -117,6 +129,7 @@ class VectorStore:
                         "chunk_index": chunk_index,
                         "filename": filename,
                         "content": content,
+                        "created_at": created_at,
                     },
                 )
             ],
@@ -154,6 +167,7 @@ class VectorStore:
         content: str,
     ) -> str:
         point_id = str(uuid4())
+        created_at = datetime.now(timezone.utc).isoformat()
         self.client.upsert(
             collection_name=self.documents_collection,
             points=[
@@ -167,6 +181,7 @@ class VectorStore:
                         "telegram_chat_id": telegram_chat_id,
                         "telegram_message_id": telegram_message_id,
                         "content": content,
+                        "created_at": created_at,
                     },
                 )
             ],

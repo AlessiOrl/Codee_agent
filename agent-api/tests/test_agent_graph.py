@@ -9,6 +9,7 @@ class FakeRepo:
         self.user_id = uuid4()
         self.conversation_id = uuid4()
         self.saved = []
+        self.memories = []
 
     def upsert_user(self, **kwargs):
         return {"id": self.user_id, **kwargs}
@@ -31,10 +32,31 @@ class FakeRepo:
         return 1
 
     def save_memory(self, **kwargs):
-        return {"id": uuid4(), **kwargs}
+        row = {"id": uuid4(), **kwargs}
+        self.memories.append(row)
+        return row
+
+    def get_memory_by_content(self, **kwargs):
+        for memory in self.memories:
+            if (
+                memory["user_id"] == kwargs["user_id"]
+                and memory["channel"] == kwargs["channel"]
+                and memory["content"].lower() == kwargs["content"].lower()
+            ):
+                return memory
+        return None
 
     def save_summary(self, **kwargs):
         return {"id": uuid4(), **kwargs}
+
+    def search_memories_keyword(self, **kwargs):
+        return []
+
+    def search_document_chunks_keyword(self, **kwargs):
+        return []
+
+    def search_context_messages_keyword(self, **kwargs):
+        return []
 
     def recent_context_messages(self, **kwargs):
         return [
@@ -107,6 +129,48 @@ class NoPrivateContextVector(EmptyContextVector):
         return []
 
 
+class WrongChannelContextVector(FakeVector):
+    def search_context_messages(self, **kwargs):
+        self.search_calls += 1
+        self.context_search_calls.append(kwargs)
+        return [
+            {
+                "payload": {
+                    "source_type": "context_message",
+                    "channel": "plex",
+                    "content": "This should not cross into domotics.",
+                },
+                "score": 0.99,
+            }
+        ]
+
+
+class KeywordContextRepo(FakeRepo):
+    def search_context_messages_keyword(self, **kwargs):
+        return [
+            {
+                "id": uuid4(),
+                "channel": "domotics",
+                "telegram_chat_id": "11",
+                "telegram_message_id": "201",
+                "content": "Garage sensor battery is 9 percent.",
+                "qdrant_point_id": "keyword-context-1",
+                "created_at": "2026-06-09T20:00:00Z",
+                "keyword_score": 1.0,
+            },
+            {
+                "id": uuid4(),
+                "channel": "plex",
+                "telegram_chat_id": "33",
+                "telegram_message_id": "301",
+                "content": "Plex keyword hit must not be injected.",
+                "qdrant_point_id": "keyword-context-2",
+                "created_at": "2026-06-09T20:00:00Z",
+                "keyword_score": 1.0,
+            },
+        ]
+
+
 class FakeLlm:
     def __init__(self) -> None:
         self.calls = []
@@ -124,6 +188,23 @@ class FakeLlm:
         yield {"type": "delta", "content": "streamed "}
         yield {"type": "delta", "content": "answer"}
         yield {"type": "done", "content": "streamed answer", "sources": []}
+
+
+class MemoryExtractingLlm(FakeLlm):
+    def chat(self, messages, *, use_web_search=None):
+        self.calls.append(messages)
+        if "You decide whether passive notification feed context" in messages[0]["content"]:
+            return LlmResult(content='{"channels": [], "confidence": 0.0, "rationale": "private memory"}')
+        if "Extract only durable" in messages[0]["content"]:
+            return LlmResult(
+                content=(
+                    '{"memories": ['
+                    '{"content": "User is evaluating hybrid retrieval.", '
+                    '"memory_type": "project", "importance": 4, "confidence": 0.7}'
+                    "]}"
+                )
+            )
+        return LlmResult(content="final answer")
 
 
 class FencedRouterLlm(FakeLlm):
@@ -274,6 +355,45 @@ def test_selected_feed_uses_recent_messages_when_semantic_search_is_empty() -> N
     assert "The stored number is 42." in answer_prompt
 
 
+def test_keyword_feed_retrieval_stays_inside_router_selected_channel() -> None:
+    repo = KeywordContextRepo()
+    llm = FakeLlm()
+    vector = WrongChannelContextVector()
+    graph = AgentGraph(
+        repository=repo,
+        vector_store=vector,
+        llm=llm,
+        system_prompt="System prompt.",
+        recent_history_limit=20,
+        summary_every_n_messages=12,
+        cross_channel_memory_limit=3,
+        cross_channel_doc_limit=2,
+        cross_channel_min_score=0.6,
+        context_router_enabled=True,
+        context_router_max_feed_messages=6,
+        context_router_min_confidence=0.4,
+        context_debug_json=False,
+    )
+
+    state = graph.invoke(
+        {
+            "telegram_user_id": "1",
+            "telegram_chat_id": "2",
+            "channel": "private",
+            "telegram_message_id": "3",
+            "username": "orlando",
+            "first_name": "Orlando",
+            "text": "What is the garage sensor battery in domotics?",
+        }
+    )
+
+    assert state["context_channels"] == ["domotics"]
+    context_contents = [hit["payload"]["content"] for hit in state["context_messages"]]
+    assert "Garage sensor battery is 9 percent." in context_contents
+    assert "Plex keyword hit must not be injected." not in context_contents
+    assert "This should not cross into domotics." not in context_contents
+
+
 def test_followup_web_question_resolves_number_from_recent_transcript() -> None:
     repo = FollowupRepo()
     llm = FakeLlm()
@@ -350,6 +470,46 @@ def test_telegram_command_does_not_call_llm_or_vector_search() -> None:
     assert llm.calls == []
     assert vector.search_calls == 0
     assert len(repo.saved) == 2
+
+
+def test_memory_extraction_stores_source_and_confidence() -> None:
+    repo = FakeRepo()
+    llm = MemoryExtractingLlm()
+    vector = FakeVector()
+    graph = AgentGraph(
+        repository=repo,
+        vector_store=vector,
+        llm=llm,
+        system_prompt="System prompt.",
+        recent_history_limit=20,
+        summary_every_n_messages=12,
+        cross_channel_memory_limit=3,
+        cross_channel_doc_limit=2,
+        cross_channel_min_score=0.6,
+        context_router_enabled=True,
+        context_router_max_feed_messages=6,
+        context_router_min_confidence=0.4,
+        context_debug_json=False,
+    )
+
+    graph.invoke(
+        {
+            "telegram_user_id": "1",
+            "telegram_chat_id": "2",
+            "channel": "private",
+            "telegram_message_id": "3",
+            "username": "orlando",
+            "first_name": "Orlando",
+            "text": "Remember that I am evaluating hybrid retrieval.",
+        }
+    )
+
+    assert len(repo.memories) == 1
+    memory = repo.memories[0]
+    assert memory["content"] == "User is evaluating hybrid retrieval."
+    assert memory["confidence"] == 0.7
+    assert memory["source_user_message_id"] == repo.saved[0]["id"]
+    assert "Remember that I am evaluating hybrid retrieval." in memory["source_text"]
 
 
 def test_stream_invocation_saves_final_assistant_message() -> None:

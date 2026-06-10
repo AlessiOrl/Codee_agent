@@ -71,6 +71,10 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     qdrant_point_id TEXT,
     importance INTEGER NOT NULL DEFAULT 1,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    source_user_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
+    source_assistant_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
+    source_text TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -107,6 +111,10 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS channel TEXT;
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL;
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS channel TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_user_message_id UUID REFERENCES messages(id) ON DELETE SET NULL;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_assistant_message_id UUID REFERENCES messages(id) ON DELETE SET NULL;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_text TEXT;
 UPDATE conversations
 SET channel = telegram_chat_id
 WHERE channel IS NULL;
@@ -123,6 +131,12 @@ CREATE INDEX IF NOT EXISTS idx_conversations_channel
 ON conversations (channel);
 CREATE INDEX IF NOT EXISTS idx_memories_user_channel
 ON memories (user_id, channel);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_content
+ON document_chunks USING gin (to_tsvector('simple', content));
+CREATE INDEX IF NOT EXISTS idx_memories_content
+ON memories USING gin (to_tsvector('simple', content));
+CREATE INDEX IF NOT EXISTS idx_context_messages_content
+ON context_messages USING gin (to_tsvector('simple', content));
 """
 
 

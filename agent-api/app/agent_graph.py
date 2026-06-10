@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any, Iterator, TypedDict
 from uuid import UUID
 
@@ -7,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.openwebui import LlmResult, OpenWebUIClient
 from app.repository import Repository
+from app.retrieval import hybrid_rerank, row_to_hit
 from app.vector_store import VectorStore
 
 LOGGER = logging.getLogger(__name__)
@@ -375,23 +377,38 @@ class AgentGraph:
                 },
             )
             return {"context_messages": []}
+        limit = self.context_router_max_feed_messages
+        candidate_limit = max(limit * 3, limit)
         vector_messages = self.vector_store.search_context_messages(
             user_id=state["user"]["id"],
             channels=channels,
             query=state["text"],
-            limit=self.context_router_max_feed_messages,
+            limit=candidate_limit,
         )
         for message in vector_messages:
             message["retrieval_source"] = "semantic"
+            message["retrieval_sources"] = ["semantic"]
+            message.setdefault("payload", {}).setdefault("source_type", "context_message")
 
-        remaining = max(0, self.context_router_max_feed_messages - len(vector_messages))
+        keyword_messages = self._keyword_context_hits(
+            user_id=state["user"]["id"],
+            channels=channels,
+            query=state["text"],
+            limit=candidate_limit,
+        )
         recent_rows = self.repository.recent_context_messages(
             user_id=state["user"]["id"],
             channels=channels,
-            limit=remaining,
+            limit=limit,
         )
         recent_messages = [self._context_row_to_hit(row) for row in recent_rows]
-        messages = self._merge_context_hits(vector_messages, recent_messages)
+        messages = hybrid_rerank(
+            query=state["text"],
+            hits=[*vector_messages, *keyword_messages, *recent_messages],
+            limit=limit,
+            allowed_channels=set(channels),
+            allowed_source_types={"context_message"},
+        )
         self._debug_json(
             "context_retrieval_results",
             {
@@ -399,10 +416,11 @@ class AgentGraph:
                 "telegram_chat_id": state.get("telegram_chat_id"),
                 "db_user_id": str(state.get("user", {}).get("id")),
                 "selected_channels": channels,
-                "limit": self.context_router_max_feed_messages,
+                "limit": limit,
                 "query": compact_text(state.get("text")),
                 "count": len(messages),
                 "semantic_count": len(vector_messages),
+                "keyword_count": len(keyword_messages),
                 "recent_count": len(recent_messages),
                 "hits": [self._hit_debug(hit) for hit in messages],
             },
@@ -412,20 +430,58 @@ class AgentGraph:
     def retrieve_memories(self, state: AgentState) -> AgentState:
         if is_telegram_command(state["text"]):
             return {"memories": []}
+        limit = 8
+        candidate_limit = limit * 3
         memories = self.vector_store.search_memories(
             user_id=state["user"]["id"],
             query=state["text"],
             channels=[PRIVATE_CHANNEL],
+            limit=candidate_limit,
+        )
+        for memory in memories:
+            memory["retrieval_source"] = "semantic"
+            memory["retrieval_sources"] = ["semantic"]
+        keyword_memories = self._keyword_memory_hits(
+            user_id=state["user"]["id"],
+            query=state["text"],
+            channels=[PRIVATE_CHANNEL],
+            limit=candidate_limit,
+        )
+        memories = hybrid_rerank(
+            query=state["text"],
+            hits=[*memories, *keyword_memories],
+            limit=limit,
+            allowed_channels={PRIVATE_CHANNEL},
         )
         return {"memories": memories}
 
     def retrieve_documents(self, state: AgentState) -> AgentState:
         if is_telegram_command(state["text"]):
             return {"documents": []}
+        limit = 8
+        candidate_limit = limit * 3
         documents = self.vector_store.search_documents(
             user_id=state["user"]["id"],
             query=state["text"],
             channels=[PRIVATE_CHANNEL],
+            limit=candidate_limit,
+        )
+        for document in documents:
+            document["retrieval_source"] = "semantic"
+            document["retrieval_sources"] = ["semantic"]
+            document.setdefault("payload", {}).setdefault("source_type", "document_chunk")
+        keyword_documents = self._keyword_document_hits(
+            user_id=state["user"]["id"],
+            query=state["text"],
+            channels=[PRIVATE_CHANNEL],
+            limit=candidate_limit,
+        )
+        documents = hybrid_rerank(
+            query=state["text"],
+            hits=[*documents, *keyword_documents],
+            limit=limit,
+            allowed_channels={PRIVATE_CHANNEL},
+            allowed_source_types={"document_chunk"},
         )
         return {"documents": documents}
 
@@ -501,13 +557,25 @@ class AgentGraph:
                 continue
             memory_type = str(memory.get("memory_type") or "fact")
             importance = int(memory.get("importance") or 1)
+            confidence = self._bounded_float(memory.get("confidence"), default=1.0, minimum=0.0, maximum=1.0)
+            importance = max(1, min(5, importance))
+            if self._memory_exists(
+                user_id=state["user"]["id"],
+                channel=PRIVATE_CHANNEL,
+                content=content,
+            ):
+                continue
+            source_text = f"User: {state['text']}\nAssistant: {state.get('reply', '')}"
             point_id = self.vector_store.upsert_memory(
                 user_id=state["user"]["id"],
                 conversation_id=state["conversation"]["id"],
                 channel=PRIVATE_CHANNEL,
                 content=content,
                 memory_type=memory_type,
-                importance=max(1, min(5, importance)),
+                importance=importance,
+                confidence=confidence,
+                source_user_message_id=state.get("user_message", {}).get("id"),
+                source_text=source_text,
             )
             self.repository.save_memory(
                 user_id=state["user"]["id"],
@@ -516,7 +584,10 @@ class AgentGraph:
                 content=content,
                 memory_type=memory_type,
                 qdrant_point_id=point_id,
-                importance=max(1, min(5, importance)),
+                importance=importance,
+                confidence=confidence,
+                source_user_message_id=state.get("user_message", {}).get("id"),
+                source_text=source_text,
             )
         return {}
 
@@ -584,6 +655,10 @@ class AgentGraph:
             )
         if state.get("summary"):
             context_blocks.append(f"Private chat summary:\n{state['summary']}")
+
+        followup_rules = self._followup_reference_rules(state)
+        if followup_rules:
+            context_blocks.append(followup_rules)
 
         memory_lines = [
             f"- {hit['payload'].get('content')}"
@@ -679,6 +754,26 @@ class AgentGraph:
 
         return "\n\n".join(sections) if sections else "(none)"
 
+    @staticmethod
+    def _followup_reference_rules(state: AgentState) -> str | None:
+        text = str(state.get("text") or "").lower()
+        if "this number" not in text and "that number" not in text and "with this number" not in text:
+            return None
+        for message in reversed(state.get("recent_messages", [])):
+            if message.get("role") != "assistant":
+                continue
+            numbers = re.findall(r"\b\d+\b", str(message.get("content") or ""))
+            if not numbers:
+                continue
+            number = numbers[-1]
+            return (
+                "Follow-up reference resolution:\n"
+                f"- The recent private transcript indicates to treat the number as {number}.\n"
+                "- The user's follow-up grants permission to search if the requested answer is not in stored context.\n"
+                "- If web search is available, use that value as the web search subject."
+            )
+        return None
+
     def _debug_json(self, event: str, payload: dict[str, Any]) -> None:
         if not self.context_debug_json:
             return
@@ -692,7 +787,10 @@ class AgentGraph:
         payload = hit.get("payload", {})
         return {
             "score": hit.get("score"),
+            "keyword_score": hit.get("keyword_score"),
+            "hybrid_score": hit.get("hybrid_score"),
             "retrieval_source": hit.get("retrieval_source"),
+            "retrieval_sources": hit.get("retrieval_sources"),
             "channel": payload.get("channel"),
             "source_type": payload.get("source_type"),
             "telegram_chat_id": payload.get("telegram_chat_id"),
@@ -705,6 +803,7 @@ class AgentGraph:
         return {
             "score": None,
             "retrieval_source": "recent",
+            "retrieval_sources": ["recent"],
             "payload": {
                 "source_type": "context_message",
                 "channel": row.get("channel"),
@@ -714,6 +813,62 @@ class AgentGraph:
                 "created_at": row.get("created_at"),
             },
         }
+
+    def _keyword_memory_hits(
+        self,
+        *,
+        user_id: UUID,
+        query: str,
+        channels: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        search = getattr(self.repository, "search_memories_keyword", None)
+        if search is None:
+            return []
+        rows = search(user_id=user_id, query=query, channels=channels, limit=limit)
+        return [row_to_hit(row, source_type="memory") for row in rows]
+
+    def _keyword_document_hits(
+        self,
+        *,
+        user_id: UUID,
+        query: str,
+        channels: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        search = getattr(self.repository, "search_document_chunks_keyword", None)
+        if search is None:
+            return []
+        rows = search(user_id=user_id, query=query, channels=channels, limit=limit)
+        return [row_to_hit(row, source_type="document_chunk") for row in rows]
+
+    def _keyword_context_hits(
+        self,
+        *,
+        user_id: UUID,
+        channels: list[str],
+        query: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        search = getattr(self.repository, "search_context_messages_keyword", None)
+        if search is None:
+            return []
+        rows = search(user_id=user_id, channels=channels, query=query, limit=limit)
+        return [row_to_hit(row, source_type="context_message") for row in rows]
+
+    def _memory_exists(self, *, user_id: UUID, channel: str, content: str) -> bool:
+        lookup = getattr(self.repository, "get_memory_by_content", None)
+        if lookup is None:
+            return False
+        return bool(lookup(user_id=user_id, channel=channel, content=content))
+
+    @staticmethod
+    def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(maximum, parsed))
 
     @staticmethod
     def _merge_context_hits(
