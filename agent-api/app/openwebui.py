@@ -97,6 +97,33 @@ def extract_stream_delta(data: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
+def is_gemma_model(model: str) -> bool:
+    return "gemma" in model.lower()
+
+
+def normalize_messages_for_model(messages: list[dict[str, str]], *, model: str) -> list[dict[str, str]]:
+    if not is_gemma_model(model):
+        return [dict(message) for message in messages]
+
+    system_parts = [
+        message.get("content", "").strip()
+        for message in messages
+        if message.get("role") == "system" and message.get("content", "").strip()
+    ]
+    normalized = [dict(message) for message in messages if message.get("role") != "system"]
+    if not system_parts:
+        return normalized
+
+    system_text = "\n\n".join(system_parts)
+    prefix = f"Instructions and context:\n{system_text}\n\nUser message:\n"
+    for message in normalized:
+        if message.get("role") == "user":
+            message["content"] = prefix + message.get("content", "")
+            return normalized
+
+    return [{"role": "user", "content": system_text}, *normalized]
+
+
 class OpenWebUIClient:
     def __init__(
         self,
@@ -175,7 +202,7 @@ class OpenWebUIClient:
 
             payload: dict[str, Any] = {
                 "model": model,
-                "messages": messages,
+                "messages": normalize_messages_for_model(messages, model=model),
                 "stream": False,
             }
             if chat_id:
@@ -269,7 +296,7 @@ class OpenWebUIClient:
 
             payload: dict[str, Any] = {
                 "model": model,
-                "messages": messages,
+                "messages": normalize_messages_for_model(messages, model=model),
                 "stream": True,
             }
             if chat_id:

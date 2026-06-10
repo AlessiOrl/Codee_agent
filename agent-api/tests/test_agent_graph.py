@@ -783,6 +783,44 @@ def test_telegram_command_does_not_call_llm_or_vector_search() -> None:
     assert len(repo.saved) == 2
 
 
+class RecordingMemoryPromptLlm:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def chat(self, messages, *, use_web_search=None):
+        self.calls.append(messages)
+        return LlmResult(content='{"memories": []}')
+
+
+def test_memory_extraction_prompt_is_strict_and_avoids_secrets() -> None:
+    repo = FakeRepo()
+    llm = RecordingMemoryPromptLlm()
+    graph = AgentGraph(
+        repository=repo,
+        vector_store=FakeVector(),
+        llm=llm,
+        system_prompt="System prompt.",
+        recent_history_limit=20,
+        summary_every_n_messages=12,
+        cross_channel_memory_limit=3,
+        cross_channel_doc_limit=2,
+        cross_channel_min_score=0.6,
+        context_router_enabled=False,
+        context_router_max_feed_messages=6,
+        context_router_min_confidence=0.4,
+        context_debug_json=False,
+    )
+
+    graph.maybe_extract_memory({"text": "remember I like concise replies", "reply": "Got it."})
+
+    prompt = llm.calls[0][0]["content"]
+    assert "Return strict JSON only" in prompt
+    assert "confidence 0-1" in prompt
+    assert "one-off requests" in prompt
+    assert "API keys, passwords, tokens" in prompt
+    assert "Do not wrap JSON in Markdown" in prompt
+
+
 def test_memory_extraction_stores_source_and_confidence() -> None:
     repo = FakeRepo()
     llm = MemoryExtractingLlm()

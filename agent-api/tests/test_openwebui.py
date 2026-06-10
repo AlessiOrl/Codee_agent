@@ -1,3 +1,5 @@
+import json
+
 import respx
 from httpx import Response
 
@@ -105,6 +107,138 @@ def test_openwebui_client_stream_chat_parses_deltas() -> None:
     ]
     sent = completion.calls.last.request.content.decode("utf-8")
     assert '"stream":true' in sent
+
+
+@respx.mock
+def test_gemma_chat_moves_system_messages_into_first_user_message() -> None:
+    base_url = "http://openwebui.test"
+    respx.post(f"{base_url}/api/v1/chats/new").mock(
+        return_value=Response(200, json={"id": "chat-1"})
+    )
+    completion = respx.post(f"{base_url}/api/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={"choices": [{"message": {"content": "pong"}}]},
+        )
+    )
+    respx.delete(f"{base_url}/api/v1/chats/chat-1").mock(
+        return_value=Response(200, json={"ok": True})
+    )
+    client = OpenWebUIClient(
+        base_url=base_url,
+        api_key="secret",
+        model="gemma4:e4b",
+        fallback_model=None,
+        ollama_base_url=None,
+        ollama_status_timeout_seconds=1,
+        timeout_seconds=5,
+        use_web_search=False,
+        embedding_model=None,
+    )
+
+    client.chat(
+        [
+            {"role": "system", "content": "System A."},
+            {"role": "system", "content": "System B."},
+            {"role": "user", "content": "ping"},
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "next question"},
+        ]
+    )
+
+    payload = json.loads(completion.calls.last.request.content.decode("utf-8"))
+    assert all(message["role"] != "system" for message in payload["messages"])
+    assert payload["messages"][0]["role"] == "user"
+    assert payload["messages"][0]["content"].startswith("Instructions and context:\nSystem A.\n\nSystem B.")
+    assert payload["messages"][0]["content"].endswith("User message:\nping")
+    assert payload["messages"][1:] == [
+        {"role": "assistant", "content": "previous answer"},
+        {"role": "user", "content": "next question"},
+    ]
+
+
+@respx.mock
+def test_non_gemma_chat_leaves_system_messages_unchanged() -> None:
+    base_url = "http://openwebui.test"
+    respx.post(f"{base_url}/api/v1/chats/new").mock(
+        return_value=Response(200, json={"id": "chat-1"})
+    )
+    completion = respx.post(f"{base_url}/api/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={"choices": [{"message": {"content": "pong"}}]},
+        )
+    )
+    respx.delete(f"{base_url}/api/v1/chats/chat-1").mock(
+        return_value=Response(200, json={"ok": True})
+    )
+    client = OpenWebUIClient(
+        base_url=base_url,
+        api_key="secret",
+        model="model-a",
+        fallback_model=None,
+        ollama_base_url=None,
+        ollama_status_timeout_seconds=1,
+        timeout_seconds=5,
+        use_web_search=False,
+        embedding_model=None,
+    )
+    messages = [
+        {"role": "system", "content": "System prompt."},
+        {"role": "user", "content": "ping"},
+    ]
+
+    client.chat(messages)
+
+    payload = json.loads(completion.calls.last.request.content.decode("utf-8"))
+    assert payload["messages"] == messages
+
+
+@respx.mock
+def test_gemma_stream_chat_moves_system_messages_into_first_user_message() -> None:
+    base_url = "http://openwebui.test"
+    respx.post(f"{base_url}/api/v1/chats/new").mock(
+        return_value=Response(200, json={"id": "chat-1"})
+    )
+    completion = respx.post(f"{base_url}/api/chat/completions").mock(
+        return_value=Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"ok"}}]}\n'
+                "data: [DONE]\n"
+            ),
+        )
+    )
+    respx.delete(f"{base_url}/api/v1/chats/chat-1").mock(
+        return_value=Response(200, json={"ok": True})
+    )
+    client = OpenWebUIClient(
+        base_url=base_url,
+        api_key="secret",
+        model="my-gemma-4-e4b",
+        fallback_model=None,
+        ollama_base_url=None,
+        ollama_status_timeout_seconds=1,
+        timeout_seconds=5,
+        use_web_search=False,
+        embedding_model=None,
+    )
+
+    events = list(
+        client.stream_chat(
+            [
+                {"role": "system", "content": "System prompt."},
+                {"role": "user", "content": "ping"},
+            ]
+        )
+    )
+
+    payload = json.loads(completion.calls.last.request.content.decode("utf-8"))
+    assert events[-1] == {"type": "done", "content": "ok", "sources": []}
+    assert all(message["role"] != "system" for message in payload["messages"])
+    assert payload["messages"][0]["content"] == (
+        "Instructions and context:\nSystem prompt.\n\nUser message:\nping"
+    )
 
 
 @respx.mock

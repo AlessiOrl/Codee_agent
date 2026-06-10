@@ -936,7 +936,8 @@ class AgentGraph:
                     "Extract only durable user facts, preferences, project details, "
                     "or recurring instructions from the latest exchange. Return JSON "
                     "with a top-level 'memories' array. Each item must have content, "
-                    "memory_type, and importance 1-5. Return an empty array if none."
+                    "memory_type, importance 1-5, and confidence 0-1. Return an empty array if none. "
+                    "Do not wrap JSON in Markdown."
                 ),
             },
             {
@@ -1047,14 +1048,15 @@ class AgentGraph:
                 "role": "system",
                 "content": (
                     "Decompose a private assistant request only when it contains multiple distinct tasks. "
-                    "Return strict JSON with keys subtasks and risk_reasons. Each subtask must have id, "
+                    "Return strict JSON only with keys subtasks and risk_reasons. Each subtask must have id, "
                     "description, needs_feed_context, needs_external_context, selected_channel, and depends_on. "
                     "selected_channel may be domotics, unraid, plex, private, or null. Mark "
                     "needs_external_context true for outside-world facts that need current or public knowledge. "
                     "Treat generic references to feed chats as a request to check all configured passive feeds "
                     "separately. Preserve dependencies between subtasks: if one part establishes a value, event, "
                     "or condition that another part uses, keep those as separate ordered subtasks and reference "
-                    "the earlier id in depends_on. Do not invent feed context when the request is ordinary chat."
+                    "the earlier id in depends_on. Do not invent feed context when the request is ordinary chat. "
+                    "Do not wrap JSON in Markdown."
                 ),
             },
             {"role": "user", "content": state["text"]},
