@@ -120,11 +120,12 @@ sequenceDiagram
     G->>Q: semantic retrieve memories and documents
     G->>P: keyword retrieve memories and documents
     G->>P: load summary and recent history
-    G->>O: route passive context if needed
-    G->>Q: semantic retrieve selected passive feed context
-    G->>P: keyword and recent retrieve selected passive feed context
-    G->>O: stream chat completion
-    O-->>G: deltas and sources
+    G->>G: plan request and subtasks
+    G->>O: gate ambiguous feed context if needed
+    G->>Q: semantic retrieve scoped passive feed context
+    G->>P: keyword and recent retrieve scoped passive feed context
+    G->>O: generate chat completion
+    O-->>G: answer and sources
     G-->>A: NDJSON delta events
     A-->>B: NDJSON stream
     B->>T: edit placeholder with partial text
@@ -171,52 +172,106 @@ inside the bot.
 ## LangGraph Response Pipeline
 
 The core orchestration lives in `agent-api/app/agent_graph.py`. The compiled
-graph has the following nodes:
+graph is:
 
-```text
-load_or_create_user
-load_or_create_conversation
-save_user_message
-retrieve_memories
-retrieve_documents
-load_summary
-load_recent_history
-choose_context_channels
-retrieve_context_messages
-generate_response
-maybe_extract_memory
-maybe_update_summary
-save_assistant_message
+```mermaid
+flowchart TD
+    START([START])
+    END([END])
+
+    START --> load_user[load_or_create_user]
+    load_user --> load_conversation[load_or_create_conversation]
+    load_conversation --> save_user[save_user_message]
+
+    save_user --> retrieve_memories[retrieve_memories]
+    retrieve_memories --> retrieve_documents[retrieve_documents]
+    retrieve_documents --> load_summary[load_summary]
+    load_summary --> load_history[load_recent_history]
+
+    load_history --> plan[plan_request]
+    plan --> gate[gate_context_per_subtask]
+    gate --> retrieve_scoped[retrieve_per_subtask]
+    retrieve_scoped --> resolve_external[resolve_external_subtasks]
+
+    resolve_external --> generate[generate_response]
+
+    generate --> extract_memory[maybe_extract_memory]
+    extract_memory --> update_summary[maybe_update_summary]
+    update_summary --> save_assistant[save_assistant_message]
+    save_assistant --> END
 ```
 
 For streaming requests, `AgentGraph.stream()` prepares the state through the
-same retrieval and context-selection steps, then calls `OpenWebUIClient.stream_chat()`.
-It yields each LLM delta immediately, accumulates the final reply, extracts
-memories, maybe updates the summary, saves the assistant message, and emits a
-final `done` event.
+same planning, context-gating, feed retrieval, and external fact resolution
+steps. Low-risk answers still call `OpenWebUIClient.stream_chat()` and yield
+deltas immediately. Feed-backed, external-fact-backed, and multi-part answers
+currently use a non-streaming final generation path so source aggregation and
+context grouping stay simple.
 
 Commands are treated specially. If the incoming text starts with `/`, vector
 search and LLM calls are skipped for command replies, and the assistant message
 is still saved.
 
+The planning and retrieval section behaves like this:
+
+```mermaid
+flowchart TD
+    user_msg[Private user message] --> plan{plan_request}
+
+    plan -->|simple private chat| direct[No feed context]
+    plan -->|explicit feed named| explicit[Scoped feed subtask]
+    plan -->|feed-related but unclear| gate[LLM context gate]
+    plan -->|multi-part request| multi[Multiple scoped subtasks]
+    plan -->|current/public fact needed| external[External fact subtask]
+
+    gate -->|confident single feed| scoped[Selected feed only]
+    gate -->|ambiguous or low confidence| clarify[Ask clarification]
+
+    explicit --> retrieve[retrieve_per_subtask]
+    scoped --> retrieve
+    multi --> retrieve
+    direct --> maybe_external{external fact needed?}
+    clarify --> final_clarify[Return clarification]
+
+    retrieve --> grouped[Grouped evidence by subtask and channel]
+    grouped --> maybe_external
+    external --> maybe_external
+    maybe_external -->|yes| resolve[resolve_external_subtasks]
+    maybe_external -->|no| answer[generate_response]
+    resolve --> external_evidence[External resolved context]
+    external_evidence --> answer
+
+    answer --> done[Save and return]
+```
+
+Generic all-feed wording such as `feed chat`, `feed chats`, `the feed`,
+`the feeds`, `notification chats`, or `stored feeds` is treated as an explicit
+request to check every configured passive feed. The graph creates one scoped
+subtask for each of `domotics`, `unraid`, and `plex`, retrieves each feed
+separately, and keeps the evidence grouped by channel. Mixed requests can also
+include a non-feed subtask before those feed checks, for example resolving a
+value or condition and then comparing it against each feed. This is allowed
+because the answer compares feed-specific evidence without transferring the
+meaning of one feed into another.
+
 ### Hybrid Retrieval and Reranking
 
-Private memories, private documents, and router-selected passive feed messages
-use the same local ranking pattern:
+Private memories, private documents, and context-gated passive feed messages use
+the same local ranking pattern:
 
 1. Retrieve a wider candidate set from Qdrant using dense embeddings.
 2. Retrieve matching rows from Postgres full-text search using `simple`
    `tsvector` indexes.
-3. Add recent passive feed rows for the router-selected feed channels.
+3. Add recent passive feed rows only for the selected feed channel.
 4. Merge duplicate hits by point id, chunk id, Telegram message id, or content.
 5. Filter candidates to the allowed channel and source type.
 6. Rerank with a deterministic hybrid score that combines semantic similarity,
    keyword overlap, recency, and memory importance.
 
 This reranker lives in `agent-api/app/retrieval.py`. It does not call an LLM or
-external service. The passive-feed router remains the only component that can
-select `domotics`, `unraid`, or `plex`; hybrid retrieval operates only inside
-the channels returned by that router.
+external service. Passive feed retrieval is scoped by the context gate first:
+explicit feed mentions or a confident LLM gate select a feed for each subtask,
+and hybrid retrieval operates only inside that selected channel.
 
 ### Prompt Assembly
 
@@ -227,13 +282,25 @@ available:
 - Latest private chat summary.
 - Relevant private memories.
 - Relevant private documents.
-- Selected passive feed context.
+- External resolved context for outside/current subtasks.
+- Grouped passive feed context by subtask and channel.
 - Recent private message history as chat messages.
 
 The priority rules tell the model to resolve follow-up references from recent
-private history, prefer stored passive feed context for `domotics`, `unraid`,
-and `plex` questions, and only use Open WebUI web search after stored context is
-insufficient.
+private history, use passive feed context only inside the matching feed, avoid
+transferring meaning across `domotics`, `unraid`, and `plex`, and keep resolved
+external facts separate from feed evidence. If an external result is disabled,
+unavailable, or unsourced, the final answer should treat the dependent part as
+partial or uncertain instead of claiming a definite match.
+
+### External Fact Resolution
+
+When planning marks a subtask as needing outside/current knowledge, the graph
+runs `resolve_external_subtasks` before final generation. This node calls Open
+WebUI with `use_web_search=True` only for that narrow subtask and stores the
+assistant content plus any returned sources in `external_results`. Normal final
+generation still follows `OPENWEBUI_USE_WEB_SEARCH`, so it can remain offline by
+default while current/public premises are resolved explicitly.
 
 For follow-up questions that explicitly refer to "this number" or "that number",
 the prompt includes a small deterministic reference-resolution hint derived from
@@ -285,12 +352,13 @@ sequenceDiagram
 
     U->>B: Private question
     B->>A: POST /chat/stream
-    A->>O: Ask router for relevant feeds
-    O-->>A: JSON channels and confidence
-    A->>Q: semantic search selected feeds
-    A->>P: keyword and recent search selected feeds
-    A->>A: rerank selected-feed candidates
-    A->>O: generate answer with selected feed context
+    A->>A: Plan request into scoped subtasks
+    A->>O: Gate feed context when no feed is explicit
+    O-->>A: selected_channel, confidence, ambiguity
+    A->>Q: semantic search selected feed per subtask
+    A->>P: keyword and recent search selected feed per subtask
+    A->>A: rerank each scoped candidate group
+    A->>O: generate answer with grouped feed evidence
 ```
 
 Feed chat ids are mapped in `telegram-bot` settings:
@@ -308,21 +376,38 @@ The API stores each passive message twice:
 - In Qdrant's documents collection with `source_type = context_message`.
 - In Postgres `context_messages` with the Qdrant point id.
 
-During private chat, the context router asks the LLM for strict JSON with:
+During private chat, the request planner first decides whether the message is a
+simple private-chat turn, a feed-related turn, or a multi-part request. Explicit
+feed names such as `domotics`, `unraid`, and `plex` become scoped subtasks
+without an LLM gate. Generic all-feed wording also bypasses the LLM gate and
+expands to one subtask per configured feed. Feed-related requests without an
+explicit feed or generic all-feed wording ask the LLM context gate for strict
+JSON with:
 
-- `channels`
+- `selected_channel`
 - `confidence`
+- `ambiguous`
+- `clarifying_question`
 - `rationale`
 
 Only `domotics`, `unraid`, and `plex` are accepted. If confidence is below
-`CONTEXT_ROUTER_MIN_CONFIDENCE`, no passive feed is used. When channels are
-selected, the API searches only those channels. Semantic Qdrant hits, Postgres
-keyword hits, and recent Postgres feed rows are merged, filtered to the selected
-channels, deduplicated, and reranked down to `CONTEXT_ROUTER_MAX_FEED_MESSAGES`.
-No keyword or vector retrieval path can add a passive feed channel that the
-router did not select.
+`CONTEXT_GATE_MIN_CONFIDENCE`, or the gate marks the request ambiguous, no
+passive feed is searched and Codee asks a clarifying question. When a feed is
+selected, the API searches only that channel for that subtask. Semantic Qdrant
+hits, Postgres keyword hits, and recent Postgres feed rows are merged, filtered
+to the selected channel, deduplicated, and reranked down to
+`CONTEXT_ROUTER_MAX_FEED_MESSAGES` per subtask. No keyword or vector retrieval
+path can add another passive feed channel to that subtask.
 
-When `CONTEXT_ROUTER_ENABLED=false`, passive feed routing is skipped.
+When `CONTEXT_ROUTER_ENABLED=false`, explicit feed mentions still work, but
+ambiguous feed-related requests ask for clarification instead of calling the LLM
+gate.
+
+Feed-backed, external-fact-backed, and multi-part answers currently use one
+final generation call after planning, context gating, scoped retrieval, and
+optional external fact resolution. There is no separate review or repair LLM
+call, keeping the behavior simpler while the retrieval and prompting flow is
+being stabilized.
 
 ## Document Upload Pipeline
 
@@ -452,6 +537,11 @@ When `OPENWEBUI_USE_WEB_SEARCH=true`, chat requests include `tool_ids` with
 `web_search`. Router, memory extraction, and summary calls explicitly disable
 web search because they are internal control prompts.
 
+When `EXTERNAL_FACT_WEB_SEARCH_ENABLED=true`, the graph can also force
+`use_web_search=True` for a dedicated external fact resolver call. That does not
+enable web search for normal final generation; it only resolves detected
+outside/current subtasks before the answer is composed.
+
 ### Fallback Model Routing
 
 If `OPENWEBUI_FALLBACK_MODEL` is set and differs from `OPENWEBUI_MODEL`, the
@@ -518,16 +608,17 @@ Routine HTTP client logs and noisy infrastructure logs are reduced by default.
 Docker logging is bounded by the Compose `json-file` settings.
 
 `CONTEXT_DEBUG_JSON=true` enables structured JSON-shaped debug logs for context
-behavior. These logs can include user message text, feed message text, router
-decisions, retrieved hits, and prompt context sections. It should be enabled
-only while diagnosing routing or retrieval behavior.
+behavior. These logs can include user message text, feed message text, planner
+decisions, context-gate decisions, retrieved hits, prompt context sections, and
+external resolution outcomes. It should be enabled only while diagnosing routing
+or retrieval behavior.
 
 Useful debug events include:
 
 - Telegram route decisions.
 - Passive context ingestion requests and responses.
-- Context router requests, parse failures, and selected channels.
-- Semantic, keyword, recent, and reranked passive feed retrieval results.
+- Context gate requests, parse failures, ambiguity, and selected channels.
+- Semantic, keyword, recent, and reranked passive feed retrieval results by subtask.
 - Final prompt context assembly.
 
 ## Error Handling

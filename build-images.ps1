@@ -2,7 +2,7 @@ param(
     [string]$Platform = "linux/amd64",
     [string]$RegistryUser = "alessiorl",
     [string]$BetaTag = "beta",
-    [string]$VersionTag = "v2",
+    [string]$VersionTag = "v3",
     [switch]$NoPush,
     [switch]$DryRun
 )

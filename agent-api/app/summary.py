@@ -12,6 +12,7 @@ class SummaryService:
             return {
                 "reply": (
                     "No summary is stored yet for this chat.\n\n"
+                    "Summaries are plain text stored in Postgres, not embeddings."
                 ),
                 "summary": None,
                 "summary_created_at": None,
@@ -25,6 +26,7 @@ class SummaryService:
             return {
                 "reply": (
                     "No summary is stored yet for this chat.\n\n"
+                    "Summaries are plain text stored in Postgres, not embeddings."
                 ),
                 "summary": None,
                 "summary_created_at": None,
@@ -35,6 +37,7 @@ class SummaryService:
             return {
                 "reply": (
                     "No summary is stored yet for this chat.\n\n"
+                    "Summaries are plain text stored in Postgres, not embeddings."
                 ),
                 "summary": None,
                 "summary_created_at": None,
@@ -46,6 +49,7 @@ class SummaryService:
             "reply": (
                 "Current chat summary:\n"
                 f"{latest['summary']}\n\n"
+                "This is plain text stored in Postgres, not embeddings."
             ),
             "summary": latest["summary"],
             "summary_created_at": created_text,

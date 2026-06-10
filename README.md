@@ -69,6 +69,7 @@ OPENWEBUI_API_KEY=your_openwebui_api_token
 OPENWEBUI_MODEL=your_model_id
 OPENWEBUI_FALLBACK_MODEL=optional_backup_model_id
 OPENWEBUI_USE_WEB_SEARCH=false
+EXTERNAL_FACT_WEB_SEARCH_ENABLED=true
 
 EMBEDDING_PROVIDER=ollama
 OLLAMA_BASE_URL=http://host.docker.internal:11434
@@ -82,6 +83,8 @@ CROSS_CHANNEL_MIN_SCORE=0.6
 CONTEXT_ROUTER_ENABLED=true
 CONTEXT_ROUTER_MAX_FEED_MESSAGES=6
 CONTEXT_ROUTER_MIN_CONFIDENCE=0.4
+CONTEXT_GATE_MIN_CONFIDENCE=0.65
+CONTEXT_GATE_ASK_ON_AMBIGUOUS=true
 CONTEXT_DEBUG_JSON=false
 ```
 
@@ -93,6 +96,7 @@ How these values are used:
 - `AGENT_API_URL` is the URL the Telegram bot uses to call `agent-api`; inside Compose, `http://agent-api:8000` is correct.
 - `OPENWEBUI_API_KEY` is the token from your external Open WebUI instance.
 - `OPENWEBUI_BASE_URL` is the fixed address that the `agent-api` container uses to reach Open WebUI for chat. If Open WebUI runs on your Windows host, `http://host.docker.internal:<port>` is correct.
+- `OPENWEBUI_USE_WEB_SEARCH=false` keeps normal final generation offline by default. `EXTERNAL_FACT_WEB_SEARCH_ENABLED=true` allows detected outside/current subtasks to run one narrow web-enabled resolver call before the final answer.
 - `EMBEDDING_PROVIDER` selects `hash`, `openwebui`, or `ollama`. Use `ollama` to call Ollama directly for embeddings while keeping Open WebUI for chat.
 - `OPENWEBUI_FALLBACK_MODEL` is optional. If set, Codee can use this model on the same `OPENWEBUI_BASE_URL` when the primary Ollama server is unavailable.
 - `OLLAMA_STATUS_TIMEOUT_SECONDS` controls the fast Ollama status check before generation. If the primary Ollama server does not respond within this short timeout, Codee sends the same Open WebUI chat request with `OPENWEBUI_FALLBACK_MODEL` instead of `OPENWEBUI_MODEL`.
@@ -103,8 +107,11 @@ How these values are used:
 - `DOMOTICS_CHAT_ID`, `UNRAID_CHAT_ID`, and `PLEX_CHAT_ID` map passive Telegram feeds to the fixed logical channels used for storage and context routing.
 - `LOG_LEVEL` controls Python service verbosity with compact one-line logs. `DOCKER_LOG_MAX_SIZE` and `DOCKER_LOG_MAX_FILE` keep every container log bounded.
 - `POSTGRES_LOG_MIN_MESSAGES`, `POSTGRES_LOG_MIN_ERROR_STATEMENT`, and `QDRANT_LOG_LEVEL` reduce routine infrastructure noise.
-- `CONTEXT_ROUTER_ENABLED`, `CONTEXT_ROUTER_MAX_FEED_MESSAGES`, and `CONTEXT_ROUTER_MIN_CONFIDENCE` control the LangGraph router that decides whether passive feed context is useful for a private chat question.
-- `CONTEXT_DEBUG_JSON=true` prints JSON-shaped debug events for Telegram feed routing, context ingestion, LangGraph router decisions, feed retrieval, and prompt context assembly. These logs include message text, so leave it off except while debugging.
+- `CONTEXT_ROUTER_ENABLED` enables the LLM context gate for feed-related private chat questions that do not explicitly name a feed.
+- `CONTEXT_ROUTER_MAX_FEED_MESSAGES` caps retrieved passive feed messages per scoped sub-request.
+- `CONTEXT_GATE_MIN_CONFIDENCE` and `CONTEXT_GATE_ASK_ON_AMBIGUOUS` control the stricter feed context gate. Ambiguous feed questions fail closed with a clarification instead of mixing `domotics`, `unraid`, and `plex` context.
+- `CONTEXT_ROUTER_MIN_CONFIDENCE` remains supported for compatibility with older `.env` files.
+- `CONTEXT_DEBUG_JSON=true` prints JSON-shaped debug events for Telegram feed routing, context ingestion, context-gate decisions, feed retrieval, external resolution, and prompt context assembly. These logs include message text, so leave it off except while debugging.
 
 Notes:
 
@@ -130,7 +137,9 @@ DELETE /api/v1/chats/{id}
 
 Embeddings default to local hash embeddings so the stack can run without an embedding service. Set `EMBEDDING_PROVIDER=ollama`, `OLLAMA_EMBEDDINGS_BASE_URL=...`, `EMBEDDING_MODEL=...`, and `VECTOR_SIZE=...` to call Ollama directly via `POST /api/embed`. Set `EMBEDDING_PROVIDER=openwebui` to use Open WebUI's `POST /api/embeddings` endpoint instead.
 
-Retrieval uses a hybrid local pipeline. Qdrant provides dense semantic candidates, Postgres full-text search provides keyword candidates, and `agent-api` reranks them with a deterministic score that combines semantic similarity, keyword overlap, recency, and memory importance. Passive feed retrieval still only happens after the LLM router selects `domotics`, `unraid`, or `plex`; keyword search never bypasses that router decision.
+Retrieval uses a hybrid local pipeline. Qdrant provides dense semantic candidates, Postgres full-text search provides keyword candidates, and `agent-api` reranks them with a deterministic score that combines semantic similarity, keyword overlap, recency, and memory importance. Passive feed retrieval is context-gated per sub-request: explicit feed names or a confident LLM gate select the feed first, then semantic, keyword, and recent candidates are searched only inside that feed. Generic wording like "feed chat" or "feed chats" means all configured feeds are checked separately and compared per channel. Ambiguous non-generic feed requests ask a clarification instead of searching across feeds.
+
+For mixed requests that depend on outside/current facts, such as comparing a latest public result against stored feed messages, Codee resolves the outside fact in a separate web-enabled subtask when `EXTERNAL_FACT_WEB_SEARCH_ENABLED=true`. The final answer receives that result as external evidence and keeps it separate from feed evidence. If web search is unavailable, Codee gives a partial answer and avoids claiming a definite match.
 
 If existing Qdrant collections were created with a different vector size, the app keeps them intact and creates dimension-specific collections such as `user_memories_2560` and `documents_2560`.
 
@@ -177,7 +186,7 @@ The `/summary` and `/forget` commands are scoped to the private chat. `/forget_a
 
 Any other slash command is handled locally.
 
-Normal private-chat text messages are forwarded to `POST /chat/stream`. Configured `domotics`, `unraid`, and `plex` chats are passive feeds only: the bot stores their messages through `POST /context/messages` and never replies there. For private chats, LangGraph first asks an LLM router whether any passive feed is relevant. Only the router-selected feeds are searched, then semantic, keyword, and recent-feed candidates are reranked into the prompt context. The bot sends a typing action, creates a placeholder message, and edits that message as streamed text arrives. Chat responses use the streaming endpoint only. Final replies are sent with `parse_mode=MarkdownV2` so markdown-style replies, code fences, and clickable citations render correctly. If Telegram rejects the formatting, the bot automatically retries the final reply as plain text. Non-text messages in private chat receive a local unsupported-message reply.
+Normal private-chat text messages are forwarded to `POST /chat/stream`. Configured `domotics`, `unraid`, and `plex` chats are passive feeds only: the bot stores their messages through `POST /context/messages` and never replies there. For private chats, LangGraph plans the request, gates feed context per sub-request, retrieves only inside the selected feed context, and groups evidence by subtask and channel. Mixed requests can combine non-feed subtasks with generic all-feed checks, such as resolving a value or condition and then checking whether any feed chat contains a related value. Feed-backed, external-fact-backed, and multi-part answers currently use one final generation call without a second review or repair pass. Low-risk private chat answers can still stream normally. The bot sends a typing action, creates a placeholder message, and edits that message as streamed text arrives. Final replies are sent with `parse_mode=MarkdownV2` so markdown-style replies, code fences, and clickable citations render correctly. If Telegram rejects the formatting, the bot automatically retries the final reply as plain text. Non-text messages in private chat receive a local unsupported-message reply.
 
 Smoke test in Telegram:
 

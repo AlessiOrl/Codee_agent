@@ -132,6 +132,9 @@ async def lifespan(app: FastAPI):
         context_router_enabled=settings.context_router_enabled,
         context_router_max_feed_messages=settings.context_router_max_feed_messages,
         context_router_min_confidence=settings.context_router_min_confidence,
+        context_gate_min_confidence=settings.context_gate_min_confidence,
+        context_gate_ask_on_ambiguous=settings.context_gate_ask_on_ambiguous,
+        external_fact_web_search_enabled=settings.external_fact_web_search_enabled,
         context_debug_json=settings.context_debug_json,
     )
     app.state.document_service = DocumentService(

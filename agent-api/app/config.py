@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     openwebui_model: str = Field(alias="OPENWEBUI_MODEL")
     openwebui_fallback_model: str | None = Field(default=None, alias="OPENWEBUI_FALLBACK_MODEL")
     openwebui_use_web_search: bool = Field(default=False, alias="OPENWEBUI_USE_WEB_SEARCH")
+    external_fact_web_search_enabled: bool = Field(default=True, alias="EXTERNAL_FACT_WEB_SEARCH_ENABLED")
     openwebui_timeout_seconds: int = Field(default=120, alias="OPENWEBUI_TIMEOUT_SECONDS")
 
     embedding_provider: str | None = Field(default=None, alias="EMBEDDING_PROVIDER")
@@ -45,6 +46,8 @@ class Settings(BaseSettings):
     context_router_enabled: bool = Field(default=True, alias="CONTEXT_ROUTER_ENABLED")
     context_router_max_feed_messages: int = Field(default=6, alias="CONTEXT_ROUTER_MAX_FEED_MESSAGES")
     context_router_min_confidence: float = Field(default=0.4, alias="CONTEXT_ROUTER_MIN_CONFIDENCE")
+    context_gate_min_confidence: float = Field(default=0.65, alias="CONTEXT_GATE_MIN_CONFIDENCE")
+    context_gate_ask_on_ambiguous: bool = Field(default=True, alias="CONTEXT_GATE_ASK_ON_AMBIGUOUS")
     context_debug_json: bool = Field(default=False, alias="CONTEXT_DEBUG_JSON")
 
 
